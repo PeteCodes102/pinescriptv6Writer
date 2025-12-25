@@ -1,1 +1,275 @@
+//@version=6
+strategy("BB & MA Crossover System with Trailing SL", 
+         overlay=true, 
+         initial_capital=10000, 
+         default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=10,
+         commission_type=strategy.commission.percent,
+         commission_value=0.1,
+         slippage=2)
 
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// Bollinger Bands Settings
+bb_length = input.int(20, "BB Length", minval=1, group="Bollinger Bands")
+bb_mult = input.float(2.0, "BB Multiplier", minval=0.1, step=0.1, group="Bollinger Bands")
+
+// Moving Average Settings
+fast_ma_length = input.int(9, "Fast MA Length", minval=1, group="Moving Averages")
+slow_ma_length = input.int(21, "Slow MA Length", minval=1, group="Moving Averages")
+ma_type = input.string("EMA", "MA Type", options=["SMA", "EMA"], group="Moving Averages")
+
+// ATR Settings for TP/SL
+atr_length = input.int(14, "ATR Length", minval=1, group="Risk Management")
+atr_sl_mult = input.float(1.5, "ATR SL Multiplier", minval=0.1, step=0.1, group="Risk Management")
+atr_tp_mult = input.float(2.5, "ATR TP Multiplier", minval=0.1, step=0.1, group="Risk Management")
+
+// Trailing Stop Settings
+trail_activation_mult = input.float(1.0, "Trail Activation (ATR)", minval=0.1, step=0.1, group="Trailing Stop")
+trail_offset_mult = input.float(0.75, "Trail Offset (ATR)", minval=0.1, step=0.1, group="Trailing Stop")
+
+// Confluence Filters
+use_volume_filter = input.bool(true, "Use Volume Filter", group="Confluence Filters")
+volume_ma_length = input.int(20, "Volume MA Length", minval=1, group="Confluence Filters")
+use_trend_filter = input.bool(true, "Use Trend Filter (200 MA)", group="Confluence Filters")
+trend_ma_length = input.int(200, "Trend MA Length", minval=1, group="Confluence Filters")
+
+// ============================================================================
+// INDICATOR CALCULATIONS
+// ============================================================================
+
+// Bollinger Bands
+[bb_middle, bb_upper, bb_lower] = ta.bb(close, bb_length, bb_mult)
+
+// Moving Averages
+fast_ma = ma_type == "EMA" ? ta.ema(close, fast_ma_length) : ta.sma(close, fast_ma_length)
+slow_ma = ma_type == "EMA" ? ta.ema(close, slow_ma_length) : ta.sma(close, slow_ma_length)
+
+// Trend Filter - 200 period MA
+trend_ma = ta.sma(close, trend_ma_length)
+
+// ATR for dynamic TP/SL
+atr = ta.atr(atr_length)
+
+// Volume Analysis
+volume_ma = ta.sma(volume, volume_ma_length)
+volume_surge = volume > volume_ma * 1.2
+
+// ============================================================================
+// ENTRY CONDITIONS
+// ============================================================================
+
+// MA Crossover Signals
+ma_bullish_cross = ta.crossover(fast_ma, slow_ma)
+ma_bearish_cross = ta.crossunder(fast_ma, slow_ma)
+
+// Bollinger Band Position
+price_above_bb_middle = close > bb_middle
+price_below_bb_middle = close < bb_middle
+bb_squeeze = (bb_upper - bb_lower) / bb_middle < 0.02 // Narrow bands indicate potential breakout
+
+// BB Bounce Conditions
+bb_lower_touch = low <= bb_lower and close > bb_lower
+bb_upper_touch = high >= bb_upper and close < bb_upper
+
+// BB Breakout Conditions  
+bb_upper_breakout = close > bb_upper and close[1] <= bb_upper[1]
+bb_lower_breakout = close < bb_lower and close[1] >= bb_lower[1]
+
+// Trend Filter
+bullish_trend = use_trend_filter ? close > trend_ma : true
+bearish_trend = use_trend_filter ? close < trend_ma : true
+
+// Volume Filter
+volume_confirmed = use_volume_filter ? volume_surge : true
+
+// ============================================================================
+// LONG ENTRY CONFLUENCES
+// ============================================================================
+
+// Strategy 1: MA Cross + BB Middle Support
+long_signal_1 = ma_bullish_cross and price_above_bb_middle and bullish_trend and volume_confirmed
+
+// Strategy 2: BB Lower Band Bounce + Fast MA Above Slow MA  
+long_signal_2 = bb_lower_touch and fast_ma > slow_ma and bullish_trend and volume_confirmed
+
+// Strategy 3: BB Breakout Confirmation with MA Alignment
+long_signal_3 = bb_upper_breakout and fast_ma > slow_ma and bullish_trend and volume_confirmed
+
+// Combined Long Entry
+long_entry = long_signal_1 or long_signal_2 or long_signal_3
+
+// ============================================================================
+// SHORT ENTRY CONFLUENCES
+// ============================================================================
+
+// Strategy 1: MA Cross + BB Middle Resistance
+short_signal_1 = ma_bearish_cross and price_below_bb_middle and bearish_trend and volume_confirmed
+
+// Strategy 2: BB Upper Band Rejection + Fast MA Below Slow MA
+short_signal_2 = bb_upper_touch and fast_ma < slow_ma and bearish_trend and volume_confirmed
+
+// Strategy 3: BB Breakout Confirmation with MA Alignment  
+short_signal_3 = bb_lower_breakout and fast_ma < slow_ma and bearish_trend and volume_confirmed
+
+// Combined Short Entry
+short_entry = short_signal_1 or short_signal_2 or short_signal_3
+
+// ============================================================================
+// POSITION SIZING & RISK MANAGEMENT
+// ============================================================================
+
+// Calculate SL and TP distances in ticks
+atr_ticks = atr / syminfo.mintick
+sl_distance_ticks = int(atr_sl_mult * atr_ticks)
+tp_distance_ticks = int(atr_tp_mult * atr_ticks)
+
+// Calculate trailing stop parameters in ticks
+trail_activation_ticks = int(trail_activation_mult * atr_ticks)
+trail_offset_ticks = int(trail_offset_mult * atr_ticks)
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+// Track entry prices for visualization
+var float long_entry_price = na
+var float short_entry_price = na
+var float long_sl_price = na
+var float short_sl_price = na
+var float long_tp_price = na
+var float short_tp_price = na
+
+// LONG ENTRIES
+if long_entry and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, comment="Long Entry")
+    
+    // Calculate and store levels for visualization
+    long_entry_price := close
+    long_sl_price := close - atr_sl_mult * atr
+    long_tp_price := close + atr_tp_mult * atr
+    
+    // Exit strategy with trailing stop
+    strategy.exit("Long Exit", "Long", 
+                 profit=tp_distance_ticks,
+                 loss=sl_distance_ticks,
+                 trail_points=trail_activation_ticks,
+                 trail_offset=trail_offset_ticks,
+                 comment="Long Exit")
+
+// SHORT ENTRIES  
+if short_entry and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, comment="Short Entry")
+    
+    // Calculate and store levels for visualization
+    short_entry_price := close
+    short_sl_price := close + atr_sl_mult * atr
+    short_tp_price := close - atr_tp_mult * atr
+    
+    // Exit strategy with trailing stop
+    strategy.exit("Short Exit", "Short",
+                 profit=tp_distance_ticks,
+                 loss=sl_distance_ticks, 
+                 trail_points=trail_activation_ticks,
+                 trail_offset=trail_offset_ticks,
+                 comment="Short Exit")
+
+// Reset price levels when position closes
+if ta.change(strategy.position_size) == -strategy.position_size[1] or strategy.position_size == 0
+    long_entry_price := na
+    short_entry_price := na
+    long_sl_price := na
+    short_sl_price := na
+    long_tp_price := na
+    short_tp_price := na
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+// Plot Bollinger Bands
+p1 = plot(bb_upper, "BB Upper", color=color.new(color.blue, 50), linewidth=1)
+p2 = plot(bb_lower, "BB Lower", color=color.new(color.blue, 50), linewidth=1)
+p3 = plot(bb_middle, "BB Middle", color=color.new(color.gray, 30), linewidth=1)
+fill(p1, p3, color=color.new(color.blue, 90), title="BB Upper Fill")
+fill(p2, p3, color=color.new(color.blue, 90), title="BB Lower Fill")
+
+// Plot Moving Averages
+plot(fast_ma, "Fast MA", color=color.new(color.green, 0), linewidth=2)
+plot(slow_ma, "Slow MA", color=color.new(color.red, 0), linewidth=2)
+plot(use_trend_filter ? trend_ma : na, "Trend MA", color=color.new(color.orange, 30), linewidth=2)
+
+// Plot Entry, SL, and TP levels
+plot(strategy.position_size > 0 ? long_entry_price : na, "Long Entry", 
+     color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size > 0 ? long_sl_price : na, "Long SL", 
+     color=color.new(color.red, 0), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size > 0 ? long_tp_price : na, "Long TP", 
+     color=color.new(color.lime, 0), style=plot.style_linebr, linewidth=1)
+
+plot(strategy.position_size < 0 ? short_entry_price : na, "Short Entry", 
+     color=color.new(color.red, 0), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size < 0 ? short_sl_price : na, "Short SL", 
+     color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size < 0 ? short_tp_price : na, "Short TP", 
+     color=color.new(color.maroon, 0), style=plot.style_linebr, linewidth=1)
+
+// Plot Entry Signals
+plotshape(long_entry, "Long Signal", shape.triangleup, location.belowbar, 
+         color=color.new(color.green, 0), size=size.small)
+plotshape(short_entry, "Short Signal", shape.triangledown, location.abovebar, 
+         color=color.new(color.red, 0), size=size.small)
+
+// Background colors for trend
+bgcolor(bullish_trend and use_trend_filter ? color.new(color.green, 95) : na, title="Bullish Trend BG")
+bgcolor(bearish_trend and use_trend_filter ? color.new(color.red, 95) : na, title="Bearish Trend BG")
+
+// ============================================================================
+// PERFORMANCE TABLE
+// ============================================================================
+
+var table perfTable = table.new(position.top_right, 2, 7, 
+                                 bgcolor=color.new(color.black, 85), 
+                                 border_width=1,
+                                 border_color=color.gray)
+
+if barstate.islastconfirmedhistory or barstate.isrealtime
+    // Header
+    table.cell(perfTable, 0, 0, "Metric", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(perfTable, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    
+    // Performance Metrics
+    table.cell(perfTable, 0, 1, "Net Profit", text_color=color.white)
+    table.cell(perfTable, 1, 1, str.tostring(strategy.netprofit, "#.##"), 
+              text_color=strategy.netprofit >= 0 ? color.lime : color.red)
+    
+    table.cell(perfTable, 0, 2, "Total Trades", text_color=color.white)
+    table.cell(perfTable, 1, 2, str.tostring(strategy.closedtrades), text_color=color.white)
+    
+    table.cell(perfTable, 0, 3, "Win Rate %", text_color=color.white)
+    win_rate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100 : 0
+    table.cell(perfTable, 1, 3, str.tostring(win_rate, "#.##"), 
+              text_color=win_rate >= 50 ? color.lime : color.red)
+    
+    table.cell(perfTable, 0, 4, "Profit Factor", text_color=color.white)
+    profit_factor = strategy.grossloss != 0 ? math.abs(strategy.grossprofit / strategy.grossloss) : 0
+    table.cell(perfTable, 1, 4, str.tostring(profit_factor, "#.##"), 
+              text_color=profit_factor >= 1.5 ? color.lime : color.orange)
+    
+    table.cell(perfTable, 0, 5, "Max Drawdown", text_color=color.white)
+    table.cell(perfTable, 1, 5, str.tostring(strategy.max_drawdown, "#.##"), text_color=color.red)
+    
+    table.cell(perfTable, 0, 6, "Open Position", text_color=color.white)
+    pos_text = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "NONE"
+    pos_color = strategy.position_size > 0 ? color.lime : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(perfTable, 1, 6, pos_text, text_color=pos_color)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(long_entry, "Long Entry Alert", "BB & MA System: Long Entry Signal")
+alertcondition(short_entry, "Short Entry Alert", "BB & MA System: Short Entry Signal")
+alertcondition(ta.change(strategy.closedtrades) == 1, "Trade Closed", "BB & MA System: Trade Closed")
