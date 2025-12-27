@@ -234,9 +234,7 @@ Before considering a Power Tool complete:
 ## References
 
 - Official Pine Script v6 Documentation: https://www.tradingview.com/pine-script-docs/
-- Built-in Variables: See `reference/variables.md` in this repository
-- Built-in Functions: See `reference/functions/` in this repository
-- Execution Model: See `concepts/execution_model.md` in this repository
+- Check repository for available documentation files (paths may vary by repository structure)
 
 ---
 

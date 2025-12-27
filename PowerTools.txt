@@ -15,7 +15,7 @@
 // --- SESSION INPUTS ---
 use_session = input.bool(false, "Use Session Filter", group="Session Manager")
 session_string = input.string("0930-1630:23456", "Trading Session", 
-                              tooltip="Format: HHMM-HHMM:123456\nExample: 0930-1630:23456 = 9:30-16:30, Mon-Fri (days: 1=Sun,2=Mon,3=Tue,4=Wed,5=Thu,6=Fri,7=Sat)", 
+                              tooltip="Format: HHMM-HHMM:123456 e.g., 0930-1630:23456 = 9:30-16:30, Mon-Fri", 
                               group="Session Manager")
 force_close_time = input.string("", "Force Close Time (HHMM)", 
                                 tooltip="Close all positions at this time. Leave empty to disable.", 
@@ -60,7 +60,7 @@ is_time_in_session() =>
     start_time = start_h * 100 + start_m
     end_time = end_h * 100 + end_m
     
-    // Handle sessions that cross midnight
+    // Handle sessions that cross midnight (e.g., 2200-0600 = 10 PM to 6 AM next day)
     if end_time < start_time
         current_time >= start_time or current_time <= end_time
     else
