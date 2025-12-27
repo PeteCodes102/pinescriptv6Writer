@@ -254,6 +254,28 @@ var float long_tp_price = na
 var float short_tp_price = na
 var float hard_stop_price = na
 
+// EXIT LOGIC - Process exits before entries to ensure proper position management
+
+// Hard Stop Loss Check - Close all positions if hard stop is hit
+if use_hard_stop and strategy.position_size != 0
+    if strategy.position_size > 0 and close <= hard_stop_price
+        strategy.close_all("Hard Stop Long")
+    if strategy.position_size < 0 and close >= hard_stop_price
+        strategy.close_all("Hard Stop Short")
+
+// Exit signals - Close positions when opposite signals occur
+if long_exit_signal
+    strategy.close_all("Exit Long")
+
+if short_exit_signal
+    strategy.close_all("Exit Short")
+
+// Force Close on Session End
+if force_close_now
+    strategy.close_all("Force Close")
+
+// ENTRY LOGIC - Process entries after exits
+
 // LONG ENTRIES
 if long_entry and strategy.position_size == 0
     strategy.entry("Long", strategy.long, comment="Long Entry")
@@ -295,24 +317,6 @@ if short_entry and strategy.position_size == 0
                  trail_points=trail_activation_ticks,
                  trail_offset=trail_offset_ticks,
                  comment="Short Exit")
-
-// Hard Stop Loss Check - Close all positions if hard stop is hit
-if use_hard_stop and strategy.position_size != 0
-    if strategy.position_size > 0 and close <= hard_stop_price
-        strategy.close_all("Hard Stop Long")
-    if strategy.position_size < 0 and close >= hard_stop_price
-        strategy.close_all("Hard Stop Short")
-
-// Exit signals - Close positions when opposite signals occur
-if long_exit_signal
-    strategy.close_all("Exit Long")
-
-if short_exit_signal
-    strategy.close_all("Exit Short")
-
-// Force Close on Session End
-if force_close_now
-    strategy.close_all("Force Close")
 
 // Reset price levels when position closes
 if ta.change(strategy.position_size) == -strategy.position_size[1] or strategy.position_size == 0
