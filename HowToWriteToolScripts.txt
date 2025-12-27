@@ -1,0 +1,241 @@
+# How to Write Power Tool Scripts for Pine Script v6
+# Guidelines for AI Assistants
+
+## Overview
+Power Tool scripts are modular, copy-paste code snippets that add specific functionality to any Pine Script strategy. These tools must be self-contained, lightweight, and easy to integrate without breaking existing code.
+
+## Core Principles
+
+### 1. Self-Contained Design
+- All inputs, functions, and variables should be prefixed or grouped logically
+- No dependencies on external libraries or custom indicators
+- Use only built-in Pine Script v6 functions
+- Include all necessary parsing and helper functions within the snippet
+
+### 2. Clear Documentation
+- Start with a header block explaining:
+  - What the tool does
+  - Input format and examples
+  - Integration steps
+  - Usage examples
+- Use comments liberally to explain complex logic
+- Provide tooltip text for all inputs
+
+### 3. User-Friendly Inputs
+- Group related inputs using the `group` parameter
+- Provide sensible default values
+- Use `tooltip` parameter to explain formats and expectations
+- Include validation where possible
+- Consider adding an enable/disable checkbox for optional features
+
+### 4. Minimal Footprint
+- Keep variable names descriptive but not overly verbose
+- Avoid creating unnecessary global variables
+- Use functions to encapsulate logic
+- Don't plot or display anything unless specifically requested
+- Be mindful of Pine Script's execution model (runs on every bar)
+
+## Structure Template
+
+```
+// ============================================================================
+// [TOOL NAME] - Power Tool Snippet
+// ============================================================================
+// Description: [Clear one-line description]
+// 
+// INTEGRATION:
+// 1. [Step-by-step integration instructions]
+// 2. [...]
+// 3. [...]
+// ============================================================================
+
+// --- INPUTS ---
+use_[feature] = input.bool(false, "Use [Feature]", group="[Tool Name]")
+// Additional inputs with tooltips and grouping
+
+// --- HELPER FUNCTIONS ---
+// Encapsulate logic in functions for clarity
+function_name() =>
+    // Function logic
+    result
+
+// --- STATE VARIABLES ---
+// Output variables that user's strategy will consume
+output_variable = calculation_or_function_call()
+
+// --- USAGE EXAMPLE ---
+// Show how to integrate into strategy conditions:
+//   if long_condition and output_variable
+//       strategy.entry("Long", strategy.long)
+
+// ============================================================================
+// END OF [TOOL NAME]
+// ============================================================================
+```
+
+## Integration Guidelines for Users
+
+When writing integration instructions, always include:
+
+### For Entry Conditions:
+```
+// Add 'and [condition_variable]' to your entry logic:
+if your_long_condition and session_active
+    strategy.entry("Long", strategy.long)
+
+if your_short_condition and session_active
+    strategy.entry("Short", strategy.short)
+```
+
+### For Exit/Close Logic:
+```
+// Add after your entry conditions:
+if force_close_condition
+    strategy.close_all("Reason")
+```
+
+### For Filters:
+```
+// Use as a filter in compound conditions:
+valid_entry = your_signal and filter_condition
+```
+
+## Best Practices
+
+### 1. Input Validation
+- Check string lengths before parsing
+- Provide empty string defaults for optional inputs
+- Use conditional logic to handle disabled features
+
+### 2. Time Handling
+- Use `hour`, `minute`, `dayofweek` built-in variables
+- Store times as integers (HHMM format = hour * 100 + minute)
+- Handle midnight crossover for overnight sessions
+- Consider timezone implications (scripts run in exchange timezone)
+
+### 3. Day of Week Handling
+- Pine Script dayofweek returns: 1=Sunday, 2=Monday, 3=Tuesday, 4=Wednesday, 5=Thursday, 6=Friday, 7=Saturday
+- For user-friendly input, document the format clearly in tooltips
+- Consider using string parsing for flexibility (e.g., "23456" for Mon-Fri)
+- Remember to use dayofweek constants (dayofweek.monday, etc.) when comparing directly
+
+### 4. Function Design
+- Keep functions pure (no side effects) when possible
+- Return clear boolean or numeric values
+- Use descriptive function names
+- Add inline comments for complex calculations
+
+### 5. Performance Considerations
+- Avoid nested loops where possible
+- Cache calculated values that don't change
+- Use `var` keyword for variables that should persist across bars
+- Be careful with `varip` (realtime-only persistence)
+
+## Common Patterns
+
+### Pattern 1: Time-Based Filters
+```
+// Parse time string
+parse_time_component(str, start, length) =>
+    int(str.tonumber(str.substring(str, start, start + length)))
+
+// Check if current time matches
+is_time_match(target_hour, target_minute) =>
+    hour == target_hour and minute == target_minute
+
+// Time range check
+is_in_time_range(start_h, start_m, end_h, end_m) =>
+    current = hour * 100 + minute
+    start = start_h * 100 + start_m
+    end = end_h * 100 + end_m
+    current >= start and current <= end
+```
+
+### Pattern 2: Conditional Features
+```
+use_feature = input.bool(false, "Enable Feature")
+feature_param = input.int(10, "Parameter")
+
+feature_result = use_feature ? calculation(feature_param) : true
+```
+
+### Pattern 3: String Parsing
+```
+// Find delimiter position
+delimiter_pos = str.pos(input_string, ":")
+
+// Extract substrings
+part1 = str.substring(input_string, 0, delimiter_pos)
+part2 = str.substring(input_string, delimiter_pos + 1)
+
+// Parse to numbers
+value = int(str.tonumber(part1))
+```
+
+## Testing Your Tool
+
+Before publishing a Power Tool:
+
+1. **Syntax Check**: Ensure it compiles in Pine Script v6
+2. **Integration Test**: Drop it into a simple strategy and verify it works
+3. **Edge Cases**: Test with:
+   - Empty inputs
+   - Disabled state (checkbox off)
+   - Boundary conditions (midnight, week boundaries)
+   - Different timeframes (1m, 5m, 1h, 1D)
+4. **Documentation**: Have someone else try to integrate it following only your instructions
+
+## Common Pitfalls to Avoid
+
+1. **Don't** create global state that might conflict with existing variables
+2. **Don't** use overly generic variable names (e.g., `result`, `value`)
+3. **Don't** assume the user's strategy structure
+4. **Don't** modify any of the user's existing code
+5. **Don't** add visualizations unless that's the tool's purpose
+6. **Don't** use deprecated Pine Script v5 or older syntax
+7. **Don't** forget to handle the "disabled" state gracefully
+
+## Example Use Cases for Power Tools
+
+Good candidates for Power Tools:
+- Session/time filters
+- Day of week filters
+- Position size calculators
+- Risk management helpers
+- Multi-timeframe confirmations
+- Volatility filters
+- Volume filters
+- Market regime detectors
+- Date range selectors
+- Holiday exclusion filters
+
+## Version Control
+
+- Always specify `//@version=6` in examples
+- Test against the latest Pine Script v6 features
+- Note any breaking changes from v5 if relevant
+- Keep tools forward-compatible where possible
+
+## Final Checklist
+
+Before considering a Power Tool complete:
+
+- [ ] Clear header with description and integration steps
+- [ ] All inputs grouped and documented with tooltips
+- [ ] Helper functions are clear and well-named
+- [ ] Output variables have descriptive names
+- [ ] Usage examples included in comments
+- [ ] Tested in a real strategy context
+- [ ] Works both enabled and disabled
+- [ ] No conflicts with common variable names
+- [ ] Handles edge cases gracefully
+- [ ] Documented any limitations or considerations
+
+## References
+
+- Official Pine Script v6 Documentation: https://www.tradingview.com/pine-script-docs/
+- Check repository for available documentation files (paths may vary by repository structure)
+
+---
+
+**Remember**: The goal is to make the trader's life easier, not more complex. Keep it simple, keep it clear, and make it easy to drop in and use.

@@ -1,1 +1,94 @@
+// ============================================================================
+// TRADING SESSION MANAGER - Power Tool Snippet
+// ============================================================================
+// Description: Manages trading sessions based on time and day of week
+// Format: "HHMM-HHMM:123456" where HHMM is time in 24hr format
+//         and 123456 represents days (1=Sun, 2=Mon, 3=Tue, 4=Wed, 5=Thu, 6=Fri, 7=Sat)
+// Example: "0930-1630:23456" = 9:30 AM to 4:30 PM, Mon-Fri
+//
+// INTEGRATION:
+// 1. Copy this entire section into your strategy
+// 2. Add 'and session_active' to your entry conditions
+// 3. Add force close logic: if force_close_now strategy.close_all()
+// ============================================================================
 
+// --- SESSION INPUTS ---
+use_session = input.bool(false, "Use Session Filter", group="Session Manager")
+session_string = input.string("0930-1630:23456", "Trading Session", 
+                              tooltip="Format: HHMM-HHMM:123456 e.g., 0930-1630:23456 = 9:30-16:30, Mon-Fri", 
+                              group="Session Manager")
+force_close_time = input.string("", "Force Close Time (HHMM)", 
+                                tooltip="Close all positions at this time. Leave empty to disable.", 
+                                group="Session Manager")
+
+// --- SESSION PARSING FUNCTIONS ---
+// Parse start time (HHMM from before the dash)
+parse_start_hour() =>
+    int(str.tonumber(str.substring(session_string, 0, 2)))
+
+parse_start_minute() =>
+    int(str.tonumber(str.substring(session_string, 2, 4)))
+
+// Parse end time (HHMM after the dash, before the colon)
+parse_end_hour() =>
+    dash_pos = str.pos(session_string, "-")
+    int(str.tonumber(str.substring(session_string, dash_pos + 1, dash_pos + 3)))
+
+parse_end_minute() =>
+    dash_pos = str.pos(session_string, "-")
+    int(str.tonumber(str.substring(session_string, dash_pos + 3, dash_pos + 5)))
+
+// Parse allowed days (after the colon)
+parse_days() =>
+    colon_pos = str.pos(session_string, ":")
+    str.substring(session_string, colon_pos + 1)
+
+// Check if current day is allowed
+is_day_allowed() =>
+    days_str = parse_days()
+    current_day = str.tostring(dayofweek)
+    str.contains(days_str, current_day)
+
+// Check if current time is within session
+is_time_in_session() =>
+    start_h = parse_start_hour()
+    start_m = parse_start_minute()
+    end_h = parse_end_hour()
+    end_m = parse_end_minute()
+    
+    current_time = hour * 100 + minute
+    start_time = start_h * 100 + start_m
+    end_time = end_h * 100 + end_m
+    
+    // Handle sessions that cross midnight (e.g., 2200-0600 = 10 PM to 6 AM next day)
+    if end_time < start_time
+        current_time >= start_time or current_time <= end_time
+    else
+        current_time >= start_time and current_time <= end_time
+
+// --- SESSION STATE VARIABLES ---
+session_active = use_session ? (is_day_allowed() and is_time_in_session()) : true
+
+// --- FORCE CLOSE CHECK ---
+is_force_close_time() =>
+    if force_close_time != "" and str.length(force_close_time) == 4
+        force_h = int(str.tonumber(str.substring(force_close_time, 0, 2)))
+        force_m = int(str.tonumber(str.substring(force_close_time, 2, 4)))
+        hour == force_h and minute == force_m
+    else
+        false
+
+force_close_now = use_session and is_force_close_time()
+
+// --- USAGE IN YOUR STRATEGY ---
+// Add 'and session_active' to your entry conditions:
+//   if long_condition and session_active
+//       strategy.entry("Long", strategy.long)
+//
+// Add force close logic after your entries:
+//   if force_close_now
+//       strategy.close_all("Force Close")
+//
+// ============================================================================
+// END OF TRADING SESSION MANAGER
+// ============================================================================
