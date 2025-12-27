@@ -127,6 +127,10 @@ atr_tp_mult = input.float(2.5, "ATR TP Multiplier", minval=0.1, step=0.1, group=
 trail_activation_mult = input.float(1.0, "Trail Activation (ATR)", minval=0.1, step=0.1, group="Trailing Stop")
 trail_offset_mult = input.float(0.75, "Trail Offset (ATR)", minval=0.1, step=0.1, group="Trailing Stop")
 
+// Hard Stop Settings
+use_hard_stop = input.bool(false, "Use Hard Stop Loss", group="Risk Management")
+hard_stop_percent = input.float(2.0, "Hard Stop Loss %", minval=0.1, step=0.1, group="Risk Management", tooltip="Hard stop loss as percentage of entry price")
+
 // Confluence Filters
 use_volume_filter = input.bool(true, "Use Volume Filter", group="Confluence Filters")
 volume_ma_length = input.int(20, "Volume MA Length", minval=1, group="Confluence Filters")
@@ -215,6 +219,16 @@ short_signal_3 = bb_lower_breakout and fast_ma < slow_ma and bearish_trend and v
 short_entry = (short_signal_1 or short_signal_2 or short_signal_3) and session_active
 
 // ============================================================================
+// EXIT SIGNALS
+// ============================================================================
+
+// Exit long position when short signals appear or opposite MA cross occurs
+long_exit_signal = strategy.position_size > 0 and (short_signal_1 or short_signal_2 or short_signal_3 or ma_bearish_cross)
+
+// Exit short position when long signals appear or opposite MA cross occurs  
+short_exit_signal = strategy.position_size < 0 and (long_signal_1 or long_signal_2 or long_signal_3 or ma_bullish_cross)
+
+// ============================================================================
 // POSITION SIZING & RISK MANAGEMENT
 // ============================================================================
 
@@ -238,6 +252,29 @@ var float long_sl_price = na
 var float short_sl_price = na
 var float long_tp_price = na
 var float short_tp_price = na
+var float hard_stop_price = na
+
+// EXIT LOGIC - Process exits before entries to ensure proper position management
+
+// Hard Stop Loss Check - Close all positions if hard stop is hit
+if use_hard_stop and strategy.position_size != 0
+    if strategy.position_size > 0 and close <= hard_stop_price
+        strategy.close_all("Hard Stop Long")
+    if strategy.position_size < 0 and close >= hard_stop_price
+        strategy.close_all("Hard Stop Short")
+
+// Exit signals - Close positions when opposite signals occur
+if long_exit_signal
+    strategy.close_all("Exit Long")
+
+if short_exit_signal
+    strategy.close_all("Exit Short")
+
+// Force Close on Session End
+if force_close_now
+    strategy.close_all("Force Close")
+
+// ENTRY LOGIC - Process entries after exits
 
 // LONG ENTRIES
 if long_entry and strategy.position_size == 0
@@ -247,6 +284,10 @@ if long_entry and strategy.position_size == 0
     long_entry_price := close
     long_sl_price := close - atr_sl_mult * atr
     long_tp_price := close + atr_tp_mult * atr
+    
+    // Calculate hard stop if enabled
+    if use_hard_stop
+        hard_stop_price := close * (1 - hard_stop_percent / 100)
     
     // Exit strategy with trailing stop
     strategy.exit("Long Exit", "Long", 
@@ -265,6 +306,10 @@ if short_entry and strategy.position_size == 0
     short_sl_price := close + atr_sl_mult * atr
     short_tp_price := close - atr_tp_mult * atr
     
+    // Calculate hard stop if enabled
+    if use_hard_stop
+        hard_stop_price := close * (1 + hard_stop_percent / 100)
+    
     // Exit strategy with trailing stop
     strategy.exit("Short Exit", "Short",
                  profit=tp_distance_ticks,
@@ -281,6 +326,7 @@ if ta.change(strategy.position_size) == -strategy.position_size[1] or strategy.p
     short_sl_price := na
     long_tp_price := na
     short_tp_price := na
+    hard_stop_price := na
 
 // ============================================================================
 // VISUALIZATION
@@ -312,6 +358,10 @@ plot(strategy.position_size < 0 ? short_sl_price : na, "Short SL",
      color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
 plot(strategy.position_size < 0 ? short_tp_price : na, "Short TP", 
      color=color.new(color.maroon, 0), style=plot.style_linebr, linewidth=1)
+
+// Plot Hard Stop level if enabled
+plot(use_hard_stop and strategy.position_size != 0 ? hard_stop_price : na, "Hard Stop", 
+     color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=2)
 
 // Plot Entry Signals
 plotshape(long_entry, "Long Signal", shape.triangleup, location.belowbar, 
