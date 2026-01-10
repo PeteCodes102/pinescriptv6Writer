@@ -1,0 +1,629 @@
+//@version=6
+strategy("RaTz - RSI + ATR + Trend + Zone", 
+         overlay=true, 
+         initial_capital=10000, 
+         default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=10,
+         commission_type=strategy.commission.percent,
+         commission_value=0.1,
+         slippage=2,
+         max_lines_count=500,
+         max_boxes_count=500)
+
+// ============================================================================
+// RaTz STRATEGY - RSI + ATR + Trend + Zone
+// ============================================================================
+// Description: Trade in the direction of the trend, at pre-defined zones,
+// with RSI confirming momentum, and use ATR to set/adjust SL, TP, and trailing stops.
+// ============================================================================
+
+// ============================================================================
+// INPUTS - TREND FILTER
+// ============================================================================
+
+trend_filter_type = input.string("Simple (200 EMA)", "Trend Filter Type", 
+                                 options=["Simple (200 EMA)", "Strong (50+200 EMA)"], 
+                                 group="Trend Filter (T)")
+ema_50_length = input.int(50, "50 EMA Length", minval=1, group="Trend Filter (T)")
+ema_200_length = input.int(200, "200 EMA Length", minval=1, group="Trend Filter (T)")
+
+// ============================================================================
+// INPUTS - RSI
+// ============================================================================
+
+rsi_length = input.int(14, "RSI Length", minval=1, group="RSI (R)")
+rsi_trigger_style = input.string("Reset Then Turn Up", "RSI Trigger Style", 
+                                 options=["Reset Then Turn Up", "Bullish Divergence"], 
+                                 group="RSI (R)")
+rsi_pullback_min = input.int(40, "RSI Pullback Min", minval=0, maxval=100, group="RSI (R)")
+rsi_pullback_max = input.int(50, "RSI Pullback Max", minval=0, maxval=100, group="RSI (R)")
+rsi_turn_threshold = input.int(50, "RSI Turn Up Threshold", minval=0, maxval=100, group="RSI (R)")
+
+// ============================================================================
+// INPUTS - ATR
+// ============================================================================
+
+atr_length = input.int(14, "ATR Length", minval=1, group="ATR (A)")
+atr_sl_multiplier = input.float(0.5, "ATR SL Buffer (Zone)", minval=0.1, step=0.1, group="ATR (A)")
+atr_structure_sl_multiplier = input.float(1.5, "ATR SL (Structure)", minval=0.1, step=0.1, group="ATR (A)")
+atr_volatility_threshold = input.float(1.5, "ATR Volatility Filter", minval=1.0, step=0.1, 
+                                      tooltip="Skip entries when ATR > threshold × ATR(20)", 
+                                      group="ATR (A)")
+
+// ============================================================================
+// INPUTS - ZONES & TARGETS
+// ============================================================================
+
+zone_lookback = input.int(20, "Zone Lookback (Swing Points)", minval=5, group="Zones (Z)")
+zone_strength_bars = input.int(3, "Zone Strength (Min Touch Bars)", minval=1, group="Zones (Z)")
+room_to_target_r = input.float(1.5, "Min Room to Target (R)", minval=0.5, step=0.1, group="Zones (Z)")
+
+tp1_r_multiple = input.float(1.0, "TP1 (R Multiple)", minval=0.5, step=0.1, group="Take Profit")
+tp2_r_multiple = input.float(2.5, "TP2 (R Multiple)", minval=0.5, step=0.1, group="Take Profit")
+partial_exit_percent = input.float(50, "Partial Exit at TP1 (%)", minval=0, maxval=100, group="Take Profit")
+
+// ============================================================================
+// INPUTS - TRAILING STOP
+// ============================================================================
+
+trail_start_type = input.string("After TP1", "Start Trailing", 
+                                options=["After TP1", "After +1 ATR Move", "Immediate"], 
+                                group="Trailing Stop")
+trail_method = input.string("Chandelier (ATR)", "Trail Method", 
+                            options=["Chandelier (ATR)", "Swing Structure", "EMA Trail"], 
+                            group="Trailing Stop")
+chandelier_atr_mult = input.float(2.0, "Chandelier ATR Multiplier", minval=0.5, step=0.1, group="Trailing Stop")
+swing_trail_atr_buffer = input.float(0.3, "Swing Trail ATR Buffer", minval=0.1, step=0.1, group="Trailing Stop")
+trail_ema_length = input.int(20, "EMA Trail Length", minval=1, group="Trailing Stop")
+
+// ============================================================================
+// INPUTS - ENTRY METHOD
+// ============================================================================
+
+entry_method = input.string("Close Above Zone", "Entry Method", 
+                            options=["Close Above Zone", "Limit Inside Zone", "Structure Break"], 
+                            group="Entry Trigger")
+
+// ============================================================================
+// INPUTS - VISUALIZATION
+// ============================================================================
+
+show_zones = input.bool(true, "Show Support/Resistance Zones", group="Visualization")
+show_entry_lines = input.bool(true, "Show Entry/SL/TP Lines", group="Visualization")
+show_rsi_panel = input.bool(false, "Show RSI Indicator Panel", group="Visualization")
+
+// ============================================================================
+// CALCULATIONS - TREND FILTER
+// ============================================================================
+
+ema_50 = ta.ema(close, ema_50_length)
+ema_200 = ta.ema(close, ema_200_length)
+
+// Determine trend bias based on filter type
+var bool long_trend_bias = false
+var bool short_trend_bias = false
+
+if trend_filter_type == "Simple (200 EMA)"
+    long_trend_bias := close > ema_200
+    short_trend_bias := close < ema_200
+else // Strong (50+200 EMA)
+    long_trend_bias := ema_50 > ema_200 and close > ema_50 and close > ema_200
+    short_trend_bias := ema_50 < ema_200 and close < ema_50 and close < ema_200
+
+// ============================================================================
+// CALCULATIONS - RSI
+// ============================================================================
+
+rsi = ta.rsi(close, rsi_length)
+
+// RSI Trigger Style 1: Reset Then Turn Up
+rsi_in_pullback_zone = rsi >= rsi_pullback_min and rsi <= rsi_pullback_max
+rsi_turned_up = rsi > rsi_turn_threshold and rsi[1] <= rsi_turn_threshold
+rsi_reset_signal = rsi_turned_up
+
+// RSI Trigger Style 2: Bullish Divergence (simplified - price lower low, RSI higher low)
+price_lower_low = low < ta.lowest(low[1], 5) 
+rsi_higher_low = rsi > ta.lowest(rsi[1], 5)
+rsi_divergence_signal = price_lower_low and rsi_higher_low
+
+// Select RSI trigger based on input
+rsi_long_trigger = rsi_trigger_style == "Reset Then Turn Up" ? rsi_reset_signal : rsi_divergence_signal
+rsi_short_trigger = rsi_trigger_style == "Reset Then Turn Up" ? (rsi < (100 - rsi_turn_threshold) and rsi[1] >= (100 - rsi_turn_threshold)) : (high > ta.highest(high[1], 5) and rsi < ta.highest(rsi[1], 5))
+
+// ============================================================================
+// CALCULATIONS - ATR & VOLATILITY FILTER
+// ============================================================================
+
+atr = ta.atr(atr_length)
+atr_ma = ta.sma(atr, 20)
+atr_too_high = atr > (atr_volatility_threshold * atr_ma)
+volatility_ok = not atr_too_high
+
+// ============================================================================
+// CALCULATIONS - ZONES (Support/Resistance)
+// ============================================================================
+
+// Identify swing highs and lows for zones
+swing_high = ta.pivothigh(high, zone_lookback / 2, zone_lookback / 2)
+swing_low = ta.pivotlow(low, zone_lookback / 2, zone_lookback / 2)
+
+// Store recent zones
+var float[] demand_zones = array.new_float(0)
+var float[] supply_zones = array.new_float(0)
+
+// Add new zones when swing points are detected
+if not na(swing_low)
+    array.unshift(demand_zones, swing_low)
+    if array.size(demand_zones) > 5
+        array.pop(demand_zones)
+
+if not na(swing_high)
+    array.unshift(supply_zones, swing_high)
+    if array.size(supply_zones) > 5
+        array.pop(supply_zones)
+
+// Find nearest zones
+var float nearest_demand_zone = na
+var float nearest_supply_zone = na
+
+if array.size(demand_zones) > 0
+    nearest_demand_zone := array.get(demand_zones, 0)
+    for i = 0 to array.size(demand_zones) - 1
+        zone_level = array.get(demand_zones, i)
+        if zone_level < close and zone_level > nearest_demand_zone
+            nearest_demand_zone := zone_level
+
+if array.size(supply_zones) > 0
+    nearest_supply_zone := array.get(supply_zones, 0)
+    for i = 0 to array.size(supply_zones) - 1
+        zone_level = array.get(supply_zones, i)
+        if zone_level > close and (na(nearest_supply_zone) or zone_level < nearest_supply_zone)
+            nearest_supply_zone := zone_level
+
+// Check if price is at zone
+price_at_demand_zone = not na(nearest_demand_zone) and low <= nearest_demand_zone * 1.005 and close > nearest_demand_zone * 0.995
+price_at_supply_zone = not na(nearest_supply_zone) and high >= nearest_supply_zone * 0.995 and close < nearest_supply_zone * 1.005
+
+// ============================================================================
+// CALCULATIONS - ROOM TO TARGET FILTER
+// ============================================================================
+
+// For longs: check distance to nearest supply zone
+// For shorts: check distance to nearest demand zone
+var float estimated_sl_distance = atr * atr_structure_sl_multiplier
+
+long_room_ok = true
+short_room_ok = true
+
+if not na(nearest_supply_zone)
+    distance_to_supply = nearest_supply_zone - close
+    long_room_ok := distance_to_supply >= (estimated_sl_distance * room_to_target_r)
+
+if not na(nearest_demand_zone)
+    distance_to_demand = close - nearest_demand_zone
+    short_room_ok := distance_to_demand >= (estimated_sl_distance * room_to_target_r)
+
+// ============================================================================
+// ENTRY SIGNALS - LONG SETUP
+// ============================================================================
+
+// Step 1: Trend filter
+long_trend_ok = long_trend_bias
+
+// Step 2: Zone alignment (pullback into demand zone)
+long_zone_ok = price_at_demand_zone
+
+// Step 3: RSI confirmation
+long_rsi_ok = rsi_long_trigger
+
+// Step 4: Entry trigger
+long_close_above_zone = not na(nearest_demand_zone) and close > nearest_demand_zone
+long_structure_break = close > ta.highest(high[1], 5)
+
+var bool long_entry_trigger = false
+if entry_method == "Close Above Zone"
+    long_entry_trigger := long_close_above_zone
+else if entry_method == "Structure Break"
+    long_entry_trigger := long_structure_break
+else // Limit Inside Zone
+    long_entry_trigger := price_at_demand_zone
+
+// Combined long entry
+long_entry_signal = long_trend_ok and long_zone_ok and long_rsi_ok and long_entry_trigger and volatility_ok and long_room_ok
+
+// ============================================================================
+// ENTRY SIGNALS - SHORT SETUP
+// ============================================================================
+
+// Step 1: Trend filter
+short_trend_ok = short_trend_bias
+
+// Step 2: Zone alignment (rally into supply zone)
+short_zone_ok = price_at_supply_zone
+
+// Step 3: RSI confirmation
+short_rsi_ok = rsi_short_trigger
+
+// Step 4: Entry trigger
+short_close_below_zone = not na(nearest_supply_zone) and close < nearest_supply_zone
+short_structure_break = close < ta.lowest(low[1], 5)
+
+var bool short_entry_trigger = false
+if entry_method == "Close Above Zone"
+    short_entry_trigger := short_close_below_zone
+else if entry_method == "Structure Break"
+    short_entry_trigger := short_structure_break
+else // Limit Inside Zone
+    short_entry_trigger := price_at_supply_zone
+
+// Combined short entry
+short_entry_signal = short_trend_ok and short_zone_ok and short_rsi_ok and short_entry_trigger and volatility_ok and short_room_ok
+
+// ============================================================================
+// POSITION TRACKING & LEVELS
+// ============================================================================
+
+var float entry_price = na
+var float stop_loss = na
+var float take_profit_1 = na
+var float take_profit_2 = na
+var bool tp1_hit = false
+var float trail_stop = na
+var bool trailing_active = false
+var float highest_since_entry = na
+var float lowest_since_entry = na
+var int position_bars = 0
+
+// ============================================================================
+// LONG ENTRY EXECUTION
+// ============================================================================
+
+if long_entry_signal and strategy.position_size == 0
+    entry_price := close
+    
+    // Calculate SL: below zone with ATR buffer
+    if not na(nearest_demand_zone)
+        stop_loss := nearest_demand_zone - (atr * atr_sl_multiplier)
+    else
+        stop_loss := close - (atr * atr_structure_sl_multiplier)
+    
+    // Calculate R (risk)
+    r_distance = entry_price - stop_loss
+    
+    // Calculate TPs
+    take_profit_1 := entry_price + (r_distance * tp1_r_multiple)
+    take_profit_2 := entry_price + (r_distance * tp2_r_multiple)
+    
+    // Reset tracking variables
+    tp1_hit := false
+    trailing_active := false
+    highest_since_entry := close
+    position_bars := 0
+    trail_stop := stop_loss
+    
+    // Enter position
+    strategy.entry("Long", strategy.long, comment="Long Entry")
+
+// ============================================================================
+// SHORT ENTRY EXECUTION
+// ============================================================================
+
+if short_entry_signal and strategy.position_size == 0
+    entry_price := close
+    
+    // Calculate SL: above zone with ATR buffer
+    if not na(nearest_supply_zone)
+        stop_loss := nearest_supply_zone + (atr * atr_sl_multiplier)
+    else
+        stop_loss := close + (atr * atr_structure_sl_multiplier)
+    
+    // Calculate R (risk)
+    r_distance = stop_loss - entry_price
+    
+    // Calculate TPs
+    take_profit_1 := entry_price - (r_distance * tp1_r_multiple)
+    take_profit_2 := entry_price - (r_distance * tp2_r_multiple)
+    
+    // Reset tracking variables
+    tp1_hit := false
+    trailing_active := false
+    lowest_since_entry := close
+    position_bars := 0
+    trail_stop := stop_loss
+    
+    // Enter position
+    strategy.entry("Short", strategy.short, comment="Short Entry")
+
+// ============================================================================
+// POSITION MANAGEMENT - LONGS
+// ============================================================================
+
+if strategy.position_size > 0
+    position_bars += 1
+    
+    // Track highest close since entry
+    if close > highest_since_entry or na(highest_since_entry)
+        highest_since_entry := close
+    
+    // Check TP1 hit
+    if not tp1_hit and high >= take_profit_1
+        tp1_hit := true
+        // Take partial profit
+        if partial_exit_percent > 0
+            strategy.close("Long", qty_percent=partial_exit_percent, comment="TP1 Partial")
+        // Move SL to breakeven
+        stop_loss := entry_price - (atr * 0.2)
+    
+    // Determine if trailing should start
+    if trail_start_type == "After TP1"
+        trailing_active := tp1_hit
+    else if trail_start_type == "After +1 ATR Move"
+        trailing_active := (close - entry_price) >= atr
+    else // Immediate
+        trailing_active := true
+    
+    // Calculate trailing stop based on method
+    if trailing_active
+        if trail_method == "Chandelier (ATR)"
+            new_trail = highest_since_entry - (atr * chandelier_atr_mult)
+            trail_stop := math.max(trail_stop, new_trail)
+        else if trail_method == "Swing Structure"
+            // Trail under recent higher low
+            recent_low = ta.lowest(low, 3)
+            new_trail = recent_low - (atr * swing_trail_atr_buffer)
+            trail_stop := math.max(trail_stop, new_trail)
+        else // EMA Trail
+            ema_trail = ta.ema(close, trail_ema_length)
+            new_trail = ema_trail - (atr * 0.5)
+            trail_stop := math.max(trail_stop, new_trail)
+    
+    // Exit at TP2
+    if high >= take_profit_2
+        strategy.close("Long", comment="TP2 Full Exit")
+    
+    // Exit at trailing stop
+    if trailing_active and close <= trail_stop
+        strategy.close("Long", comment="Trail Stop")
+    
+    // Exit at initial stop loss (if trailing not active or trail_stop not reached)
+    if close <= stop_loss
+        strategy.close("Long", comment="Stop Loss")
+    
+    // Exit on opposing zone rejection
+    if not na(nearest_supply_zone) and high >= nearest_supply_zone and close < nearest_supply_zone * 0.995
+        strategy.close("Long", comment="Supply Zone Reject")
+    
+    // Exit if RSI fails and rolls over
+    if rsi < 50 and rsi[1] >= 50
+        strategy.close("Long", comment="RSI Rollover")
+    
+    // Exit if trend filter weakens
+    if not long_trend_bias
+        strategy.close("Long", comment="Trend Weakened")
+
+// ============================================================================
+// POSITION MANAGEMENT - SHORTS
+// ============================================================================
+
+if strategy.position_size < 0
+    position_bars += 1
+    
+    // Track lowest close since entry
+    if close < lowest_since_entry or na(lowest_since_entry)
+        lowest_since_entry := close
+    
+    // Check TP1 hit
+    if not tp1_hit and low <= take_profit_1
+        tp1_hit := true
+        // Take partial profit
+        if partial_exit_percent > 0
+            strategy.close("Short", qty_percent=partial_exit_percent, comment="TP1 Partial")
+        // Move SL to breakeven
+        stop_loss := entry_price + (atr * 0.2)
+    
+    // Determine if trailing should start
+    if trail_start_type == "After TP1"
+        trailing_active := tp1_hit
+    else if trail_start_type == "After +1 ATR Move"
+        trailing_active := (entry_price - close) >= atr
+    else // Immediate
+        trailing_active := true
+    
+    // Calculate trailing stop based on method
+    if trailing_active
+        if trail_method == "Chandelier (ATR)"
+            new_trail = lowest_since_entry + (atr * chandelier_atr_mult)
+            trail_stop := math.min(trail_stop, new_trail)
+        else if trail_method == "Swing Structure"
+            // Trail above recent lower high
+            recent_high = ta.highest(high, 3)
+            new_trail = recent_high + (atr * swing_trail_atr_buffer)
+            trail_stop := math.min(trail_stop, new_trail)
+        else // EMA Trail
+            ema_trail = ta.ema(close, trail_ema_length)
+            new_trail = ema_trail + (atr * 0.5)
+            trail_stop := math.min(trail_stop, new_trail)
+    
+    // Exit at TP2
+    if low <= take_profit_2
+        strategy.close("Short", comment="TP2 Full Exit")
+    
+    // Exit at trailing stop
+    if trailing_active and close >= trail_stop
+        strategy.close("Short", comment="Trail Stop")
+    
+    // Exit at initial stop loss
+    if close >= stop_loss
+        strategy.close("Short", comment="Stop Loss")
+    
+    // Exit on opposing zone rejection
+    if not na(nearest_demand_zone) and low <= nearest_demand_zone and close > nearest_demand_zone * 1.005
+        strategy.close("Short", comment="Demand Zone Reject")
+    
+    // Exit if RSI fails and rolls over
+    if rsi > 50 and rsi[1] <= 50
+        strategy.close("Short", comment="RSI Rollover")
+    
+    // Exit if trend filter weakens
+    if not short_trend_bias
+        strategy.close("Short", comment="Trend Weakened")
+
+// Reset variables when position closes
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    entry_price := na
+    stop_loss := na
+    take_profit_1 := na
+    take_profit_2 := na
+    tp1_hit := false
+    trailing_active := false
+    trail_stop := na
+    highest_since_entry := na
+    lowest_since_entry := na
+    position_bars := 0
+
+// ============================================================================
+// VISUALIZATION - TREND EMAs
+// ============================================================================
+
+plot(ema_200, "200 EMA", color=color.new(color.orange, 0), linewidth=2)
+plot(trend_filter_type == "Strong (50+200 EMA)" ? ema_50 : na, "50 EMA", color=color.new(color.blue, 0), linewidth=2)
+
+// ============================================================================
+// VISUALIZATION - ZONES
+// ============================================================================
+
+// Plot zones as boxes
+var box demand_box = na
+var box supply_box = na
+
+if show_zones
+    // Demand zone
+    if not na(nearest_demand_zone) and price_at_demand_zone
+        if na(demand_box) or box.get_top(demand_box) != nearest_demand_zone * 1.01
+            box.delete(demand_box)
+            demand_box := box.new(bar_index - 10, nearest_demand_zone * 0.99, bar_index + 10, nearest_demand_zone * 1.01,
+                                  border_color=color.new(color.green, 50), 
+                                  bgcolor=color.new(color.green, 90),
+                                  border_width=1,
+                                  extend=extend.right)
+    
+    // Supply zone
+    if not na(nearest_supply_zone) and price_at_supply_zone
+        if na(supply_box) or box.get_top(supply_box) != nearest_supply_zone * 1.01
+            box.delete(supply_box)
+            supply_box := box.new(bar_index - 10, nearest_supply_zone * 0.99, bar_index + 10, nearest_supply_zone * 1.01,
+                                  border_color=color.new(color.red, 50), 
+                                  bgcolor=color.new(color.red, 90),
+                                  border_width=1,
+                                  extend=extend.right)
+
+// ============================================================================
+// VISUALIZATION - ENTRY/SL/TP LINES
+// ============================================================================
+
+if show_entry_lines
+    // Long position lines
+    plot(strategy.position_size > 0 ? entry_price : na, "Long Entry", 
+         color=color.new(color.blue, 0), style=plot.style_linebr, linewidth=2)
+    plot(strategy.position_size > 0 ? stop_loss : na, "Long SL", 
+         color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+    plot(strategy.position_size > 0 ? take_profit_1 : na, "Long TP1", 
+         color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+    plot(strategy.position_size > 0 ? take_profit_2 : na, "Long TP2", 
+         color=color.new(color.lime, 0), style=plot.style_linebr, linewidth=1)
+    plot(strategy.position_size > 0 and trailing_active ? trail_stop : na, "Long Trail", 
+         color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=2)
+    
+    // Short position lines
+    plot(strategy.position_size < 0 ? entry_price : na, "Short Entry", 
+         color=color.new(color.blue, 0), style=plot.style_linebr, linewidth=2)
+    plot(strategy.position_size < 0 ? stop_loss : na, "Short SL", 
+         color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+    plot(strategy.position_size < 0 ? take_profit_1 : na, "Short TP1", 
+         color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+    plot(strategy.position_size < 0 ? take_profit_2 : na, "Short TP2", 
+         color=color.new(color.lime, 0), style=plot.style_linebr, linewidth=1)
+    plot(strategy.position_size < 0 and trailing_active ? trail_stop : na, "Short Trail", 
+         color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=2)
+
+// ============================================================================
+// VISUALIZATION - ENTRY SIGNALS
+// ============================================================================
+
+plotshape(long_entry_signal, "Long Entry Signal", shape.triangleup, location.belowbar, 
+         color=color.new(color.green, 0), size=size.normal)
+plotshape(short_entry_signal, "Short Entry Signal", shape.triangledown, location.abovebar, 
+         color=color.new(color.red, 0), size=size.normal)
+
+// ============================================================================
+// VISUALIZATION - BACKGROUND TREND
+// ============================================================================
+
+bgcolor(long_trend_bias ? color.new(color.green, 95) : na, title="Bullish Trend")
+bgcolor(short_trend_bias ? color.new(color.red, 95) : na, title="Bearish Trend")
+
+// ============================================================================
+// VISUALIZATION - RSI PANEL (Optional)
+// ============================================================================
+
+if show_rsi_panel
+    hline(70, "RSI Overbought", color=color.new(color.red, 50), linestyle=hline.style_dotted)
+    hline(50, "RSI Midline", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
+    hline(30, "RSI Oversold", color=color.new(color.green, 50), linestyle=hline.style_dotted)
+    plot(show_rsi_panel ? rsi : na, "RSI", color=color.new(color.purple, 0), linewidth=2)
+
+// ============================================================================
+// VISUALIZATION - PERFORMANCE TABLE
+// ============================================================================
+
+var table perfTable = table.new(position.top_right, 2, 8, 
+                                bgcolor=color.new(color.black, 85), 
+                                border_width=1,
+                                border_color=color.gray)
+
+if barstate.islastconfirmedhistory or barstate.isrealtime
+    // Header
+    table.cell(perfTable, 0, 0, "RaTz Metric", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(perfTable, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    
+    // Performance Metrics
+    table.cell(perfTable, 0, 1, "Net Profit", text_color=color.white)
+    table.cell(perfTable, 1, 1, str.tostring(strategy.netprofit, format.mintick), 
+              text_color=strategy.netprofit >= 0 ? color.lime : color.red)
+    
+    table.cell(perfTable, 0, 2, "Total Trades", text_color=color.white)
+    table.cell(perfTable, 1, 2, str.tostring(strategy.closedtrades), text_color=color.white)
+    
+    table.cell(perfTable, 0, 3, "Win Rate %", text_color=color.white)
+    win_rate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100 : 0
+    table.cell(perfTable, 1, 3, str.tostring(win_rate, "#.##") + "%", 
+              text_color=win_rate >= 50 ? color.lime : color.red)
+    
+    table.cell(perfTable, 0, 4, "Profit Factor", text_color=color.white)
+    profit_factor = strategy.grossloss != 0 ? math.abs(strategy.grossprofit / strategy.grossloss) : 0
+    table.cell(perfTable, 1, 4, str.tostring(profit_factor, "#.##"), 
+              text_color=profit_factor >= 1.5 ? color.lime : color.orange)
+    
+    table.cell(perfTable, 0, 5, "Avg Win/Loss", text_color=color.white)
+    avg_win = strategy.wintrades > 0 ? strategy.grossprofit / strategy.wintrades : 0
+    avg_loss = strategy.losstrades > 0 ? strategy.grossloss / strategy.losstrades : 0
+    avg_ratio = avg_loss != 0 ? math.abs(avg_win / avg_loss) : 0
+    table.cell(perfTable, 1, 5, str.tostring(avg_ratio, "#.##"), 
+              text_color=avg_ratio >= 1.5 ? color.lime : color.orange)
+    
+    table.cell(perfTable, 0, 6, "Max Drawdown", text_color=color.white)
+    table.cell(perfTable, 1, 6, str.tostring(strategy.max_drawdown, format.mintick), text_color=color.red)
+    
+    table.cell(perfTable, 0, 7, "Position", text_color=color.white)
+    pos_text = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "NONE"
+    pos_color = strategy.position_size > 0 ? color.lime : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(perfTable, 1, 7, pos_text, text_color=pos_color)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(long_entry_signal, "Long Entry Alert", "RaTz: Long Entry Signal - All Filters Aligned")
+alertcondition(short_entry_signal, "Short Entry Alert", "RaTz: Short Entry Signal - All Filters Aligned")
+alertcondition(tp1_hit and tp1_hit[1] == false, "TP1 Hit Alert", "RaTz: Take Profit 1 Reached")
+alertcondition(strategy.position_size == 0 and strategy.position_size[1] != 0, "Position Closed", "RaTz: Position Closed")
