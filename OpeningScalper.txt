@@ -1,0 +1,279 @@
+//@version=5
+strategy("Range Scalper Strategy", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+// ============================================================================
+// INPUT SETTINGS
+// ============================================================================
+
+// Opening Range Settings
+openingRangeMinutes = input.int(15, "Opening Range Minutes", minval=1, maxval=120, group="Opening Range")
+liquidityThreshold = input.float(25.0, "Liquidity Threshold (% of ATR)", minval=0, maxval=100, group="Opening Range") / 100
+tradingWindowMinutes = input.int(90, "Trading Window (Minutes)", minval=15, maxval=240, group="Opening Range")
+
+// ATR Settings
+atrLength = input.int(14, "ATR Length (Daily)", minval=1, group="ATR Settings")
+
+// TP/SL Settings
+tpMode = input.string("Opposite End", "Take Profit Mode", options=["Opposite End", "Range Cross"], group="TP/SL Settings")
+slBuffer = input.float(0.1, "Stop Loss Buffer (%)", minval=0, maxval=5, group="TP/SL Settings") / 100
+
+// Visual Settings
+showOpeningRange = input.bool(true, "Show Opening Range Box", group="Visual")
+showTradingWindow = input.bool(true, "Show 90min Window Line", group="Visual")
+showLiquidityLabel = input.bool(true, "Show Liquidity Label", group="Visual")
+showSignals = input.bool(true, "Show Entry Signals", group="Visual")
+
+// Color Settings
+bullishRangeColor = input.color(color.new(color.green, 85), "Bullish Range", group="Colors")
+bearishRangeColor = input.color(color.new(color.red, 85), "Bearish Range", group="Colors")
+liquidityLabelColor = input.color(color.new(color.yellow, 0), "Liquidity Label", group="Colors")
+tradingWindowColor = input.color(color.new(color.blue, 0), "Trading Window", group="Colors")
+
+// ============================================================================
+// TIME FUNCTIONS
+// ============================================================================
+
+// Get market open time (9:30 AM ET for US markets)
+marketOpenHour = 9
+marketOpenMinute = 30
+
+// Check if current bar is within the opening range period
+isNewDay = ta.change(time('D'))
+var float dayStartTime = na
+var bool openingRangeCaptured = false
+
+if isNewDay
+    dayStartTime := time
+    openingRangeCaptured := false
+
+// Calculate minutes since market open
+minutesSinceOpen = (time - dayStartTime) / 60000
+
+// Check if we're in opening range period
+inOpeningRange = minutesSinceOpen >= 0 and minutesSinceOpen <= openingRangeMinutes and not openingRangeCaptured
+
+// Check if we're in trading window (after opening range, before 90 min mark)
+inTradingWindow = minutesSinceOpen > openingRangeMinutes and minutesSinceOpen <= tradingWindowMinutes
+
+// ============================================================================
+// OPENING RANGE CALCULATION
+// ============================================================================
+
+var float orHigh = na
+var float orLow = na
+var float orClose = na
+var float orOpen = na
+var bool orIsBullish = na
+var int orEndTime = na
+var int tradingWindowEndTime = na
+
+// Capture opening range
+if inOpeningRange
+    if na(orHigh) or high > orHigh
+        orHigh := high
+    if na(orLow) or low < orLow
+        orLow := low
+    if na(orOpen)
+        orOpen := open
+    orClose := close
+
+// Mark opening range as captured and save times
+if not inOpeningRange and na(openingRangeCaptured) and not na(orHigh)
+    openingRangeCaptured := true
+    orIsBullish := orClose > orOpen
+    orEndTime := time
+    tradingWindowEndTime := int(dayStartTime + tradingWindowMinutes * 60000)
+
+// Reset on new day
+if isNewDay
+    orHigh := na
+    orLow := na
+    orClose := na
+    orOpen := na
+    orIsBullish := na
+    orEndTime := na
+    tradingWindowEndTime := na
+
+// ============================================================================
+// LIQUIDITY CANDLE CALCULATION (Daily ATR)
+// ============================================================================
+
+// Request daily ATR
+dailyATR = request.security(syminfo.tickerid, "D", ta.atr(atrLength))
+
+// Calculate opening range size
+orRange = na(orHigh) or na(orLow) ? 0 : orHigh - orLow
+
+// Check if opening range is a liquidity candle
+isLiquidityCandle = orRange >= (dailyATR * liquidityThreshold)
+
+// ============================================================================
+// PATTERN DETECTION (Hammer & Engulfing)
+// ============================================================================
+
+// Bearish Hammer (for long entry after bullish OR)
+bodySize = math.abs(close - open)
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+totalRange = high - low
+
+isBearishHammer = close < open and // Bearish
+                  lowerWick > bodySize * 2 and // Long lower wick
+                  upperWick < bodySize * 0.5 and // Small upper wick
+                  totalRange > 0
+
+// Bullish Hammer (for short entry after bearish OR)
+isBullishHammer = close > open and // Bullish
+                  upperWick > bodySize * 2 and // Long upper wick
+                  lowerWick < bodySize * 0.5 and // Small lower wick
+                  totalRange > 0
+
+// Bearish Engulfing (for short entry after bullish OR)
+isBearishEngulfing = close < open and // Current bearish
+                     close[1] > open[1] and // Previous bullish
+                     open > close[1] and // Opens above previous close
+                     close < open[1] and // Closes below previous open
+                     bodySize > math.abs(close[1] - open[1]) // Engulfs previous body
+
+// Bullish Engulfing (for long entry after bearish OR)
+isBullishEngulfing = close > open and // Current bullish
+                     close[1] < open[1] and // Previous bearish
+                     open < close[1] and // Opens below previous close
+                     close > open[1] and // Closes above previous open
+                     bodySize > math.abs(close[1] - open[1]) // Engulfs previous body
+
+// ============================================================================
+// ENTRY CONDITIONS
+// ============================================================================
+
+// Long Entry:  Bullish OR + (Bearish Hammer or Bearish Engulfing) ABOVE the range
+longCondition = openingRangeCaptured and 
+                 inTradingWindow and 
+                 isLiquidityCandle and 
+                 orIsBullish and 
+                 low > orHigh and // Above opening range
+                 (isBearishHammer or isBearishEngulfing)
+
+// Short Entry: Bearish OR + (Bullish Hammer or Bullish Engulfing) BELOW the range
+shortCondition = openingRangeCaptured and 
+                  inTradingWindow and 
+                  isLiquidityCandle and 
+                  not orIsBullish and 
+                  high < orLow and // Below opening range
+                  (isBullishHammer or isBullishEngulfing)
+
+// ============================================================================
+// POSITION MANAGEMENT
+// ============================================================================
+
+// Calculate TP and SL levels
+var float longTP = na
+var float longSL = na
+var float shortTP = na
+var float shortSL = na
+
+if longCondition
+    longSL := high * (1 + slBuffer) // Slightly above high of pattern
+    longTP := tpMode == "Opposite End" ? orLow : orHigh // Bottom of range or cross back
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", limit=longTP, stop=longSL)
+
+if shortCondition
+    shortSL := low * (1 - slBuffer) // Slightly below low of pattern
+    shortTP := tpMode == "Opposite End" ? orHigh : orLow // Top of range or cross back
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", limit=shortTP, stop=shortSL)
+
+// ============================================================================
+// VISUAL ELEMENTS
+// ============================================================================
+
+// Draw Opening Range Box
+var box orBox = na
+if openingRangeCaptured and showOpeningRange and not na(orHigh)
+    boxColor = orIsBullish ?  bullishRangeColor : bearishRangeColor
+    if na(orBox) or isNewDay[1]
+        orBox := box. new(orEndTime, orHigh, tradingWindowEndTime, orLow, 
+                         border_color=boxColor, 
+                         bgcolor=boxColor, 
+                         border_width=2,
+                         extend=extend.right)
+    else
+        box.set_lefttop(orBox, orEndTime, orHigh)
+        box.set_rightbottom(orBox, tradingWindowEndTime, orLow)
+        box.set_border_color(orBox, boxColor)
+        box.set_bgcolor(orBox, boxColor)
+
+// Draw Trading Window End Line
+var line windowLine = na
+if showTradingWindow and not na(tradingWindowEndTime) and openingRangeCaptured
+    if na(windowLine) or isNewDay[1]
+        windowLine := line. new(tradingWindowEndTime, low, tradingWindowEndTime, high, 
+                               color=tradingWindowColor, 
+                               width=2, 
+                               style=line.style_dashed,
+                               extend=extend.both)
+    else
+        line. set_xy1(windowLine, tradingWindowEndTime, low)
+        line.set_xy2(windowLine, tradingWindowEndTime, high)
+
+// Liquidity Label
+var label liquidityLabel = na
+if showLiquidityLabel and openingRangeCaptured and not na(orHigh)
+    liquidityText = isLiquidityCandle ? "✓ LIQUIDITY CANDLE\n" : "✗ NOT Liquidity\n"
+    liquidityText := liquidityText + "Range: " + str.tostring(orRange, format.mintick) + "\n"
+    liquidityText := liquidityText + "ATR: " + str.tostring(dailyATR, format. mintick) + "\n"
+    liquidityText := liquidityText + "Ratio: " + str.tostring((orRange/dailyATR)*100, format.percent)
+    
+    labelColor = isLiquidityCandle ? liquidityLabelColor :  color.new(color.gray, 0)
+    
+    if na(liquidityLabel) or isNewDay[1]
+        liquidityLabel := label. new(orEndTime, orHigh, liquidityText, 
+                                    style=label. style_label_down, 
+                                    color=labelColor, 
+                                    textcolor=color.black,
+                                    size=size.normal)
+    else
+        label.set_xy(liquidityLabel, orEndTime, orHigh)
+        label.set_text(liquidityLabel, liquidityText)
+        label.set_color(liquidityLabel, labelColor)
+
+// Entry Signal Labels
+if showSignals and longCondition
+    label.new(bar_index, low, "LONG\nTP: " + str.tostring(longTP, format.mintick) + "\nSL: " + str.tostring(longSL, format.mintick), 
+              style=label.style_label_up, 
+              color=color.new(color.green, 0), 
+              textcolor=color.white,
+              size=size.large)
+
+if showSignals and shortCondition
+    label.new(bar_index, high, "SHORT\nTP: " + str. tostring(shortTP, format. mintick) + "\nSL: " + str.tostring(shortSL, format.mintick), 
+              style=label. style_label_down, 
+              color=color. new(color.red, 0), 
+              textcolor=color.white,
+              size=size.large)
+
+// ============================================================================
+// RANGE LINES (Extended for clarity)
+// ============================================================================
+
+plot(openingRangeCaptured and not na(orHigh) ? orHigh : na, "OR High", color=color.new(color.green, 50), linewidth=2, style=plot.style_line)
+plot(openingRangeCaptured and not na(orLow) ? orLow : na, "OR Low", color=color.new(color.red, 50), linewidth=2, style=plot.style_line)
+
+// ============================================================================
+// BACKGROUND COLORING
+// ============================================================================
+
+// Color opening range period
+bgcolor(inOpeningRange ? color.new(color.yellow, 90) : na, title="Opening Range Period")
+
+// Color trading window
+bgcolor(inTradingWindow and isLiquidityCandle ? color. new(color.blue, 95) : na, title="Active Trading Window")
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(longCondition, "Long Entry Signal", "Range Scalper:  Long entry triggered")
+alertcondition(shortCondition, "Short Entry Signal", "Range Scalper: Short entry triggered")
+alertcondition(openingRangeCaptured and isLiquidityCandle, "Liquidity Candle Confirmed", "Range Scalper: Opening range is a liquidity candle")
