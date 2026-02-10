@@ -1,0 +1,498 @@
+//@version=6
+indicator("Engine Meter — Dual Output Momentum",
+         shorttitle="EM",
+         overlay=false,
+         max_bars_back=500,
+         max_lines_count=10,
+         max_labels_count=50)
+
+// ============================================================================
+// ENGINE METER — DUAL OUTPUT MOMENTUM INDICATOR
+// ============================================================================
+// Normalizes 5 momentum indicators (RSI, Stochastic %K, CCI, ROC, MACD)
+// to a common [-100, +100] scale and produces two outputs:
+//
+//   M  — Momentum Score:  composite direction/strength.
+//        Uses the "clean recipe": group RSI+Stoch as oscillators, then
+//        M = mean(osc, s_macd, s_cci, s_roc), smoothed with EMA.
+//
+//   Q  — Momentum Quality: 1 - stdev(s_i) / 100, scaled 0-100 for display.
+//        High Q = indicators clustered/agreeing = clean trend.
+//        Low  Q = indicators scattered = noisy/uncertain.
+//
+// Trading Signal Logic:
+//   • Trend Continuation — |M| high AND Q high.
+//   • Mean Revert        — |M| extreme AND Q collapses.
+//   • No Trade Zone      — |M| low OR Q low.
+//
+// Five selectable modes:
+//   1. Balanced (default)  — shows both trend & mean-revert signals equally.
+//   2. Trend Following     — emphasises continuation when M and Q are strong.
+//   3. Mean Reversion      — emphasises exhaustion when Q collapses at extreme M.
+//   4. Aggressive          — lower thresholds for all signals.
+//   5. Conservative        — higher thresholds, only strongest/cleanest signals.
+//
+// Engine Status Zones:
+//   Full Power Bull   — M positive + Q high
+//   Moderate Bull     — M positive + Q moderate
+//   Idle / Uncertain  — Low |M| or low Q
+//   Moderate Bear     — M negative + Q moderate
+//   Full Power Bear   — M negative + Q high
+//   Overheated / MR   — Extreme |M| + low Q (mean-revert alert)
+// ============================================================================
+
+// ============================================================================
+// INPUTS — RSI
+// ============================================================================
+
+i_rsi_len = input.int(14, "RSI Length", minval=2, group="RSI",
+                      tooltip="Period for Relative Strength Index calculation")
+
+// ============================================================================
+// INPUTS — STOCHASTIC
+// ============================================================================
+
+i_stoch_k_len    = input.int(14, "Stochastic %K Length", minval=1, group="Stochastic",
+                             tooltip="Lookback period for raw %K")
+i_stoch_k_smooth = input.int(3, "K Smoothing", minval=1, group="Stochastic",
+                             tooltip="SMA smoothing applied to raw %K")
+i_stoch_d_smooth = input.int(3, "D Smoothing", minval=1, group="Stochastic",
+                             tooltip="SMA smoothing applied to %K to produce %D (used for reference)")
+
+// ============================================================================
+// INPUTS — CCI
+// ============================================================================
+
+i_cci_len = input.int(20, "CCI Length", minval=2, group="CCI",
+                      tooltip="Period for Commodity Channel Index calculation")
+
+// ============================================================================
+// INPUTS — ROC
+// ============================================================================
+
+i_roc_len   = input.int(12, "ROC Length", minval=1, group="ROC",
+                         tooltip="Period for Rate of Change calculation")
+i_roc_scale = input.float(5.0, "ROC Scaling Factor (r)", minval=0.1, step=0.5, group="ROC",
+                          tooltip="Divisor used to scale ROC before tanh squash. Smaller = more sensitive")
+
+// ============================================================================
+// INPUTS — MACD
+// ============================================================================
+
+i_macd_fast  = input.int(12, "MACD Fast Length", minval=1, group="MACD")
+i_macd_slow  = input.int(26, "MACD Slow Length", minval=1, group="MACD")
+i_macd_sig   = input.int(9, "MACD Signal Length", minval=1, group="MACD")
+i_macd_stdev = input.int(20, "MACD Stdev Norm Period", minval=2, group="MACD",
+                         tooltip="Rolling window for z-score normalization of MACD histogram")
+
+// ============================================================================
+// INPUTS — COMPOSITE & MODE
+// ============================================================================
+
+i_smooth_len = input.int(5, "Composite Smoothing EMA", minval=1, group="Composite",
+                         tooltip="EMA length applied to the raw composite M before plotting")
+i_mode       = input.string("Balanced", "Trading Mode",
+                            options=["Balanced", "Trend Following", "Mean Reversion", "Aggressive", "Conservative"],
+                            group="Composite",
+                            tooltip="Balanced = both signal types equally. Trend Following = emphasise continuation. Mean Reversion = emphasise exhaustion/fade. Aggressive = lower thresholds. Conservative = higher thresholds.")
+
+// ============================================================================
+// INPUTS — SIGNAL THRESHOLDS
+// ============================================================================
+
+i_m_thresh     = input.int(20, "M Signal Threshold (±)", minval=1, maxval=99, group="Thresholds",
+                           tooltip="Momentum Score must cross this level for trend entry signals")
+i_m_extreme    = input.int(60, "M Extreme Threshold (±)", minval=1, maxval=99, group="Thresholds",
+                           tooltip="Momentum Score beyond this level indicates potential exhaustion / mean-revert setup")
+i_q_thresh     = input.float(50.0, "Q Quality Threshold (0-100)", minval=0.0, maxval=100.0, step=1.0, group="Thresholds",
+                             tooltip="Momentum Quality must be above this value (displayed 0-100) for clean signals. Internally Q = 1 - stdev/100; this input is Q*100.")
+i_q_collapse   = input.float(15.0, "Q Collapse Sensitivity", minval=1.0, maxval=50.0, step=1.0, group="Thresholds",
+                             tooltip="Q drop in points over the lookback that signals a quality collapse (mean-revert trigger)")
+i_q_collapse_bars = input.int(5, "Q Collapse Lookback Bars", minval=1, maxval=50, group="Thresholds",
+                              tooltip="Number of bars to measure Q collapse over")
+
+// ============================================================================
+// INPUTS — VISUAL TOGGLES
+// ============================================================================
+
+i_show_q_area    = input.bool(true,  "Show Quality (Q) Area",        group="Visuals",
+                              tooltip="Plot Q as a filled area beneath the main M line")
+i_show_bg        = input.bool(true,  "Show Background Shading",      group="Visuals",
+                              tooltip="Background color reflects combined M+Q engine status")
+i_show_dashboard = input.bool(true,  "Show Engine Dashboard (Table)", group="Visuals",
+                              tooltip="Corner table with M, Q, signal state, agreement count")
+i_show_components = input.bool(false, "Show Individual Components",   group="Visuals",
+                               tooltip="Plot each normalized indicator as a thin line")
+i_show_signals   = input.bool(true,  "Show Signal Markers",          group="Visuals",
+                              tooltip="Plotshape markers for Go Long/Short, Fade, Uncertainty")
+i_show_zones     = input.bool(true,  "Show Zone Lines & Fills",      group="Visuals",
+                              tooltip="Horizontal lines at ±20 and ±60 with zone fills")
+
+// ============================================================================
+// INPUTS — ENGINE STATUS COLORS
+// ============================================================================
+
+i_col_full_bull  = input.color(color.green,   "Full Power Bull",    group="Engine Colors")
+i_col_mod_bull   = input.color(color.lime,    "Moderate Bull",      group="Engine Colors")
+i_col_idle       = input.color(color.yellow,  "Idle / Uncertain",   group="Engine Colors")
+i_col_mod_bear   = input.color(#ff7043,       "Moderate Bear",      group="Engine Colors",
+                               tooltip="Light red/orange for moderate bearish state")
+i_col_full_bear  = input.color(color.red,     "Full Power Bear",    group="Engine Colors")
+i_col_overheat   = input.color(color.purple,  "Overheated / MR",    group="Engine Colors",
+                               tooltip="Mean-revert alert: extreme M with collapsing Q")
+
+// ============================================================================
+// INPUTS — ALERT TOGGLES
+// ============================================================================
+
+i_alert_long     = input.bool(true, "Alert: Go Long",         group="Alerts")
+i_alert_short    = input.bool(true, "Alert: Go Short",        group="Alerts")
+i_alert_fade_l   = input.bool(true, "Alert: Exit/Fade Long",  group="Alerts")
+i_alert_fade_s   = input.bool(true, "Alert: Exit/Fade Short", group="Alerts")
+i_alert_uncertainty = input.bool(true, "Alert: Uncertainty",    group="Alerts")
+
+// ============================================================================
+// HELPER — TANH APPROXIMATION
+// ============================================================================
+// Pine Script v6 has no built-in tanh. We implement:
+//   tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+// Clamp input to ±10 so exp(20) stays within float range.
+
+_tanh(float x) =>
+    float cx  = math.max(-10.0, math.min(10.0, x))
+    float e2x = math.exp(2.0 * cx)
+    (e2x - 1.0) / (e2x + 1.0)
+
+// ============================================================================
+// MODE-ADJUSTED THRESHOLDS
+// ============================================================================
+// Each mode shifts the effective thresholds to bias toward its style.
+
+float eff_m_thresh  = switch i_mode
+    "Aggressive"      => i_m_thresh * 0.6
+    "Conservative"    => i_m_thresh * 1.5
+    "Trend Following" => i_m_thresh * 0.85
+    "Mean Reversion"  => i_m_thresh * 1.2
+    => float(i_m_thresh)
+
+float eff_m_extreme = switch i_mode
+    "Aggressive"      => i_m_extreme * 0.75
+    "Conservative"    => i_m_extreme * 1.25
+    "Trend Following" => i_m_extreme * 1.1
+    "Mean Reversion"  => i_m_extreme * 0.85
+    => float(i_m_extreme)
+
+float eff_q_thresh  = switch i_mode
+    "Aggressive"      => i_q_thresh * 0.7
+    "Conservative"    => i_q_thresh * 1.3
+    "Trend Following" => i_q_thresh * 1.1
+    "Mean Reversion"  => i_q_thresh * 0.8
+    => i_q_thresh
+
+float eff_q_collapse_sens = switch i_mode
+    "Aggressive"      => i_q_collapse * 0.7
+    "Conservative"    => i_q_collapse * 1.4
+    "Trend Following" => i_q_collapse * 1.2
+    "Mean Reversion"  => i_q_collapse * 0.7
+    => i_q_collapse
+
+// ============================================================================
+// RAW INDICATOR CALCULATIONS
+// ============================================================================
+
+raw_rsi     = ta.rsi(close, i_rsi_len)
+raw_stoch_k = ta.sma(ta.stoch(close, high, low, i_stoch_k_len), i_stoch_k_smooth)
+raw_cci     = ta.cci(close, i_cci_len)
+raw_roc     = ta.roc(close, i_roc_len)
+[macd_line, macd_signal, macd_hist] = ta.macd(close, i_macd_fast, i_macd_slow, i_macd_sig)
+
+// ============================================================================
+// STEP 1 — INDIVIDUAL NORMALIZATION TO [-100, +100]
+// ============================================================================
+
+// RSI: linear rescale from 0-100 to -100..+100
+float s_rsi = 2.0 * (raw_rsi - 50.0)
+
+// Stochastic %K: linear rescale from 0-100 to -100..+100
+float s_stoch = 2.0 * (raw_stoch_k - 50.0)
+
+// CCI: tanh squash (unbounded → bounded)
+float s_cci = 100.0 * _tanh(raw_cci / 100.0)
+
+// ROC: tanh squash with configurable scaling divisor
+float s_roc = 100.0 * _tanh(raw_roc / i_roc_scale)
+
+// MACD histogram: z-score then tanh squash
+float macd_sd   = ta.stdev(macd_hist, i_macd_stdev)
+float safe_sd   = math.max(macd_sd, 1e-10)
+float macd_z    = macd_hist / safe_sd
+float s_macd    = 100.0 * _tanh(macd_z)
+
+// ============================================================================
+// STEP 2 — DUAL OUTPUT: MOMENTUM SCORE (M) & MOMENTUM QUALITY (Q)
+// ============================================================================
+
+// --- Momentum Score M ---
+// Clean recipe: group RSI + Stoch as oscillators, then average 4 buckets
+float osc_group = (s_rsi + s_stoch) / 2.0
+float raw_M     = (osc_group + s_macd + s_cci + s_roc) / 4.0
+float M         = ta.ema(raw_M, i_smooth_len)
+
+// --- Momentum Quality Q ---
+// Q = 1 - stdev(s_i_values) / 100, clamped to [0, 1]
+// Higher Q = indicators agree = cleaner signal
+float comp_mean  = (s_rsi + s_stoch + s_cci + s_roc + s_macd) / 5.0
+float comp_var   = ((s_rsi - comp_mean) * (s_rsi - comp_mean) +
+                    (s_stoch - comp_mean) * (s_stoch - comp_mean) +
+                    (s_cci - comp_mean) * (s_cci - comp_mean) +
+                    (s_roc - comp_mean) * (s_roc - comp_mean) +
+                    (s_macd - comp_mean) * (s_macd - comp_mean)) / 5.0
+float comp_stdev = math.sqrt(math.max(comp_var, 0.0))
+float Q_raw      = 1.0 - comp_stdev / 100.0
+float Q          = math.max(0.0, math.min(1.0, Q_raw))
+float Q_display  = Q * 100.0   // 0-100 for chart
+
+// ============================================================================
+// STEP 3 — Q COLLAPSE DETECTION
+// ============================================================================
+
+float Q_prev      = nz(Q_display[i_q_collapse_bars], Q_display)
+float Q_drop      = Q_prev - Q_display
+bool  q_collapsing = Q_drop >= eff_q_collapse_sens
+
+// ============================================================================
+// STEP 4 — AGREEMENT COUNT
+// ============================================================================
+// How many of the 5 indicators share the sign of M
+
+int bull_count = (s_rsi > 0 ? 1 : 0) + (s_stoch > 0 ? 1 : 0) +
+                 (s_cci > 0 ? 1 : 0) + (s_roc > 0 ? 1 : 0) +
+                 (s_macd > 0 ? 1 : 0)
+int bear_count = 5 - bull_count
+int agree_count = M >= 0 ? bull_count : bear_count
+
+// ============================================================================
+// STEP 5 — TRADING SIGNALS
+// ============================================================================
+
+// --- Trend signals: M crosses threshold AND Q above quality ---
+bool sig_go_long  = ta.crossover(M, eff_m_thresh) and Q_display >= eff_q_thresh
+bool sig_go_short = ta.crossunder(M, -eff_m_thresh) and Q_display >= eff_q_thresh
+
+// --- Mean-revert / fade signals: extreme M AND Q collapsing ---
+bool sig_fade_long  = M > eff_m_extreme and q_collapsing
+bool sig_fade_short = M < -eff_m_extreme and q_collapsing
+
+// --- Uncertainty: Q drops below minimum quality ---
+bool sig_uncertainty = Q_display < eff_q_thresh * 0.6
+
+// --- Mode-specific gating ---
+bool mode_allow_trend = i_mode != "Mean Reversion"
+bool mode_allow_mr    = i_mode != "Trend Following"
+
+bool final_go_long    = sig_go_long  and mode_allow_trend
+bool final_go_short   = sig_go_short and mode_allow_trend
+bool final_fade_long  = sig_fade_long  and mode_allow_mr
+bool final_fade_short = sig_fade_short and mode_allow_mr
+
+// ============================================================================
+// STEP 6 — ENGINE STATUS CLASSIFICATION
+// ============================================================================
+
+string engine_status = "IDLE"
+color  engine_color  = i_col_idle
+
+if math.abs(M) > eff_m_extreme and q_collapsing
+    engine_status := "OVERHEATED"
+    engine_color  := i_col_overheat
+else if M > eff_m_thresh and Q_display >= eff_q_thresh
+    if M > eff_m_extreme
+        engine_status := "FULL POWER BULL"
+        engine_color  := i_col_full_bull
+    else
+        engine_status := "MODERATE BULL"
+        engine_color  := i_col_mod_bull
+else if M < -eff_m_thresh and Q_display >= eff_q_thresh
+    if M < -eff_m_extreme
+        engine_status := "FULL POWER BEAR"
+        engine_color  := i_col_full_bear
+    else
+        engine_status := "MODERATE BEAR"
+        engine_color  := i_col_mod_bear
+else
+    engine_status := "IDLE"
+    engine_color  := i_col_idle
+
+// ============================================================================
+// VISUALIZATION — HLINES & ZONE FILLS
+// ============================================================================
+
+h_top          = hline( 100, "+100",        color.new(color.gray, 100), linestyle=hline.style_solid)
+h_extreme_bull = hline(  60, "+60 Extreme", color.new(color.green, 60), linestyle=hline.style_dashed)
+h_thresh_bull  = hline(  20, "+20 Thresh",  color.new(color.green, 75), linestyle=hline.style_dotted)
+h_zero         = hline(   0, "Zero",        color.new(color.gray, 50),  linestyle=hline.style_solid)
+h_thresh_bear  = hline( -20, "-20 Thresh",  color.new(color.red, 75),   linestyle=hline.style_dotted)
+h_extreme_bear = hline( -60, "-60 Extreme", color.new(color.red, 60),   linestyle=hline.style_dashed)
+h_bottom       = hline(-100, "-100",        color.new(color.gray, 100), linestyle=hline.style_solid)
+
+fill(h_extreme_bull, h_top,          i_show_zones ? color.new(color.green, 90) : na, title="Strong Bull Zone")
+fill(h_thresh_bull,  h_extreme_bull, i_show_zones ? color.new(color.green, 94) : na, title="Mild Bull Zone")
+fill(h_zero,         h_thresh_bull,  i_show_zones ? color.new(color.green, 97) : na, title="Neutral Bull Zone")
+fill(h_thresh_bear,  h_zero,         i_show_zones ? color.new(color.red, 97)   : na, title="Neutral Bear Zone")
+fill(h_extreme_bear, h_thresh_bear,  i_show_zones ? color.new(color.red, 94)   : na, title="Mild Bear Zone")
+fill(h_bottom,       h_extreme_bear, i_show_zones ? color.new(color.red, 90)   : na, title="Strong Bear Zone")
+
+// ============================================================================
+// VISUALIZATION — MAIN M LINE (color gradient)
+// ============================================================================
+
+m_color = color.from_gradient(M, -100, 100, color.red, color.green)
+plot(M, "Momentum Score (M)", color=m_color, linewidth=3, style=plot.style_line)
+
+// ============================================================================
+// VISUALIZATION — Q AREA FILL
+// ============================================================================
+// Q is displayed as an area beneath the M line, scaled to ±100 range.
+// Plotted as Q_display (0-100) when M >= 0, or -Q_display when M < 0,
+// to visually hug the M line side.
+
+float q_plot_val = M >= 0 ? Q_display : -Q_display
+color q_area_col = color.new(color.aqua, math.round(90 - Q_display * 0.5))
+
+plot(i_show_q_area ? q_plot_val : na, "Quality (Q)", color=q_area_col,
+     style=plot.style_area, linewidth=1)
+
+// Quality threshold dashed line
+float q_thresh_line = M >= 0 ? eff_q_thresh : -eff_q_thresh
+plot(i_show_q_area ? q_thresh_line : na, "Q Threshold",
+     color=color.new(color.aqua, 60), linewidth=1, style=plot.style_circles)
+
+// ============================================================================
+// VISUALIZATION — BACKGROUND SHADING (Engine Status)
+// ============================================================================
+
+bg_col = engine_status == "FULL POWER BULL" ? color.new(i_col_full_bull, 85) :
+         engine_status == "MODERATE BULL"    ? color.new(i_col_mod_bull, 90)  :
+         engine_status == "FULL POWER BEAR"  ? color.new(i_col_full_bear, 85) :
+         engine_status == "MODERATE BEAR"    ? color.new(i_col_mod_bear, 90)  :
+         engine_status == "OVERHEATED"       ? color.new(i_col_overheat, 82)  :
+         color.new(i_col_idle, 95)
+
+bgcolor(i_show_bg ? bg_col : na, title="Engine Status Background")
+
+// ============================================================================
+// VISUALIZATION — SIGNAL MARKERS
+// ============================================================================
+
+plotshape(i_show_signals and final_go_long, title="Go Long",
+          style=shape.triangleup, location=location.bottom,
+          color=color.new(color.green, 0), size=size.normal, text="LONG")
+
+plotshape(i_show_signals and final_go_short, title="Go Short",
+          style=shape.triangledown, location=location.top,
+          color=color.new(color.red, 0), size=size.normal, text="SHORT")
+
+plotshape(i_show_signals and final_fade_long, title="Fade Long",
+          style=shape.diamond, location=location.absolute, price=M,
+          color=color.new(color.orange, 0), size=size.small, text="FADE")
+
+plotshape(i_show_signals and final_fade_short, title="Fade Short",
+          style=shape.diamond, location=location.absolute, price=M,
+          color=color.new(color.purple, 0), size=size.small, text="FADE")
+
+plotshape(i_show_signals and sig_uncertainty and not sig_uncertainty[1], title="Uncertainty",
+          style=shape.circle, location=location.absolute, price=0,
+          color=color.new(color.gray, 30), size=size.tiny, text="?")
+
+// ============================================================================
+// VISUALIZATION — INDIVIDUAL COMPONENTS (toggleable)
+// ============================================================================
+
+plot(i_show_components ? s_rsi   : na, "RSI Norm",   color=color.new(color.blue, 60),   linewidth=1)
+plot(i_show_components ? s_stoch : na, "Stochastic Norm", color=color.new(color.teal, 60), linewidth=1)
+plot(i_show_components ? s_cci   : na, "CCI Norm",    color=color.new(color.orange, 60), linewidth=1)
+plot(i_show_components ? s_roc   : na, "ROC Norm",    color=color.new(color.purple, 60), linewidth=1)
+plot(i_show_components ? s_macd  : na, "MACD Norm",   color=color.new(color.fuchsia, 60), linewidth=1)
+
+// ============================================================================
+// VISUALIZATION — ENGINE DASHBOARD TABLE
+// ============================================================================
+
+if i_show_dashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 6,
+                               bgcolor=color.new(color.black, 20),
+                               border_width=1,
+                               border_color=color.new(color.gray, 50))
+
+    // --- Header ---
+    table.cell(dash, 0, 0, "ENGINE METER", text_color=color.white, text_size=size.small,
+               bgcolor=color.new(color.gray, 60))
+    table.cell(dash, 1, 0, i_mode, text_color=color.white, text_size=size.tiny,
+               bgcolor=color.new(color.gray, 60))
+
+    // --- Momentum Score M ---
+    string m_dir  = M > 0 ? "▲" : M < 0 ? "▼" : "—"
+    color  m_col  = color.from_gradient(M, -100, 100, color.red, color.green)
+    string m_text = m_dir + " " + str.tostring(M, "#.0")
+    table.cell(dash, 0, 1, "M Score", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, m_text, text_color=m_col, text_size=size.small,
+               bgcolor=color.new(m_col, 80))
+
+    // --- Momentum Quality Q ---
+    color q_col = Q_display >= 70 ? color.green :
+                  Q_display >= 50 ? color.lime  :
+                  Q_display >= 30 ? color.yellow :
+                  color.red
+    table.cell(dash, 0, 2, "Q Quality", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(Q_display, "#.0"), text_color=q_col, text_size=size.small,
+               bgcolor=color.new(q_col, 80))
+
+    // --- Engine Status ---
+    table.cell(dash, 0, 3, "Status", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, engine_status, text_color=engine_color, text_size=size.small,
+               bgcolor=color.new(engine_color, 75))
+
+    // --- Signal State ---
+    string sig_label = final_go_long    ? "TREND LONG" :
+                       final_go_short   ? "TREND SHORT" :
+                       final_fade_long  ? "MEAN REVERT ▼" :
+                       final_fade_short ? "MEAN REVERT ▲" :
+                       sig_uncertainty  ? "NO TRADE" :
+                       "IDLE"
+    color sig_col = final_go_long    ? color.green :
+                    final_go_short   ? color.red :
+                    final_fade_long  ? color.orange :
+                    final_fade_short ? color.purple :
+                    sig_uncertainty  ? color.gray :
+                    color.white
+    table.cell(dash, 0, 4, "Signal", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, sig_label, text_color=sig_col, text_size=size.small,
+               bgcolor=color.new(sig_col, 75))
+
+    // --- Agreement Count ---
+    string agree_text = str.tostring(agree_count) + " / 5"
+    color  agree_col  = agree_count >= 4 ? color.green :
+                        agree_count >= 3 ? color.lime :
+                        color.orange
+    table.cell(dash, 0, 5, "Agree", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, agree_text, text_color=agree_col, text_size=size.small,
+               bgcolor=color.new(agree_col, 80))
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(i_alert_long and final_go_long, title="Go Long",
+               message="Engine Meter: GO LONG — M crossed above +" + str.tostring(i_m_thresh) + " with Q above quality threshold")
+
+alertcondition(i_alert_short and final_go_short, title="Go Short",
+               message="Engine Meter: GO SHORT — M crossed below -" + str.tostring(i_m_thresh) + " with Q above quality threshold")
+
+alertcondition(i_alert_fade_l and final_fade_long, title="Exit/Fade Long",
+               message="Engine Meter: FADE LONG — M extreme positive with Q collapsing (mean-revert setup)")
+
+alertcondition(i_alert_fade_s and final_fade_short, title="Exit/Fade Short",
+               message="Engine Meter: FADE SHORT — M extreme negative with Q collapsing (mean-revert setup)")
+
+alertcondition(i_alert_uncertainty and sig_uncertainty and not sig_uncertainty[1], title="Uncertainty",
+               message="Engine Meter: UNCERTAINTY — Q dropped below minimum quality threshold, unclear conditions")
