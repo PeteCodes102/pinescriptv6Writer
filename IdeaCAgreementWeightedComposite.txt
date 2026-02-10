@@ -1,0 +1,408 @@
+//@version=6
+indicator("Agreement-Weighted Composite Momentum",
+         shorttitle="AWC",
+         overlay=false,
+         max_bars_back=500,
+         max_labels_count=50,
+         max_lines_count=10)
+
+// ============================================================================
+// AGREEMENT-WEIGHTED COMPOSITE MOMENTUM
+// ============================================================================
+// Normalizes 5 momentum indicators (RSI, Stochastic %K, CCI, ROC, MACD)
+// to a common [-100, +100] scale, then weights the composite output by
+// how many indicators agree on direction.
+//
+// Core formula:
+//   strength  = mean(|s_i|)
+//   direction = sign(mean(s_i))
+//   agreement = (count of s_i sharing direction's sign) / 5
+//   M         = direction * strength * agreement
+//
+// Four selectable modes control how agreement affects the output:
+//   1. Standard Agreement  — M = dir * strength * agreement
+//   2. Confidence Scaled   — M = dir * strength * agreement²
+//   3. Majority Rules      — output only when agreement >= 3/5
+//   4. Unanimous           — output only when agreement = 5/5
+//
+// Signals:
+//   • Strong Aligned   — |M| crosses above 50 with agreement >= threshold
+//   • Weakening        — |M| drops below 50 after being above, agreement fading
+//   • Conflict         — high strength but low agreement (indicators fighting)
+//   • Consensus Shift  — direction flips (mean changes sign)
+// ============================================================================
+
+// ============================================================================
+// INPUTS — RSI
+// ============================================================================
+
+i_rsi_len = input.int(14, "RSI Length", minval=2, group="RSI",
+                      tooltip="Period for Relative Strength Index calculation")
+
+// ============================================================================
+// INPUTS — STOCHASTIC
+// ============================================================================
+
+i_stoch_k_len    = input.int(14, "Stochastic %K Length", minval=1, group="Stochastic",
+                             tooltip="Lookback period for raw %K")
+i_stoch_k_smooth = input.int(3, "K Smoothing", minval=1, group="Stochastic",
+                             tooltip="SMA smoothing applied to raw %K")
+
+// ============================================================================
+// INPUTS — CCI
+// ============================================================================
+
+i_cci_len = input.int(20, "CCI Length", minval=2, group="CCI",
+                      tooltip="Period for Commodity Channel Index calculation")
+
+// ============================================================================
+// INPUTS — ROC
+// ============================================================================
+
+i_roc_len   = input.int(12, "ROC Length", minval=1, group="ROC",
+                         tooltip="Period for Rate of Change calculation")
+i_roc_scale = input.float(5.0, "ROC Scaling Factor (r)", minval=0.1, step=0.5, group="ROC",
+                          tooltip="Divisor used to scale ROC before tanh squash. Smaller = more sensitive")
+
+// ============================================================================
+// INPUTS — MACD
+// ============================================================================
+
+i_macd_fast  = input.int(12, "MACD Fast Length", minval=1, group="MACD")
+i_macd_slow  = input.int(26, "MACD Slow Length", minval=1, group="MACD")
+i_macd_sig   = input.int(9, "MACD Signal Length", minval=1, group="MACD")
+i_macd_stdev = input.int(20, "MACD Stdev Norm Period", minval=2, group="MACD",
+                         tooltip="Rolling window for z-score normalization of MACD histogram")
+
+// ============================================================================
+// INPUTS — COMPOSITE
+// ============================================================================
+
+i_smooth_len = input.int(5, "Composite Smoothing EMA", minval=1, group="Composite",
+                         tooltip="EMA length applied to the final composite value")
+i_mode = input.string("Standard Agreement", "Composite Mode",
+                      options=["Standard Agreement", "Confidence Scaled", "Majority Rules", "Unanimous"],
+                      group="Composite",
+                      tooltip="Standard = dir*str*agree. Confidence = dir*str*agree². Majority = output only when >=3/5 agree. Unanimous = output only when 5/5 agree.")
+i_agree_thresh = input.int(3, "Agreement Threshold (N/5)", minval=1, maxval=5, group="Composite",
+                           tooltip="Minimum number of indicators (out of 5) that must agree for a 'strong' label")
+
+// ============================================================================
+// INPUTS — SIGNALS
+// ============================================================================
+
+i_show_strong_aligned = input.bool(true, "Show Strong Aligned Signals", group="Signals",
+                                   tooltip="Triangle when |M| crosses above 50 with sufficient agreement")
+i_show_conflict       = input.bool(true, "Show Conflict Warnings", group="Signals",
+                                   tooltip="Diamond when strength > 40 but agreement < 0.4")
+i_show_consensus      = input.bool(true, "Show Consensus Shift", group="Signals",
+                                   tooltip="Star when direction flips (mean changes sign)")
+i_show_weakening      = input.bool(true, "Show Weakening Signals", group="Signals",
+                                   tooltip="Cross when |M| drops below 50 after being above")
+
+// ============================================================================
+// INPUTS — VISUALS
+// ============================================================================
+
+i_show_agreement_line = input.bool(true, "Show Agreement Line", group="Visuals",
+                                   tooltip="Plot agreement ratio scaled to 0-100")
+i_show_strength_line  = input.bool(false, "Show Strength Line", group="Visuals",
+                                   tooltip="Plot raw average absolute strength")
+i_show_individual     = input.bool(false, "Show Individual Indicator Dots", group="Visuals",
+                                   tooltip="Small colored dots showing bull/bear state of each indicator")
+i_show_meter          = input.bool(true, "Show Agreement Meter (Table)", group="Visuals",
+                                   tooltip="Table in top-right showing agreement count and direction")
+i_show_bg             = input.bool(true, "Show Background Shading", group="Visuals",
+                                   tooltip="Background color intensity based on agreement level")
+
+// ============================================================================
+// INPUTS — COLORS
+// ============================================================================
+
+i_col_bull     = input.color(color.green,  "Bull Color",     group="Colors")
+i_col_bear     = input.color(color.red,    "Bear Color",     group="Colors")
+i_col_neutral  = input.color(color.gray,   "Neutral Color",  group="Colors")
+i_col_conflict = input.color(color.orange, "Conflict Color",  group="Colors")
+
+// ============================================================================
+// HELPER — TANH APPROXIMATION
+// ============================================================================
+// Pine Script v6 has no built-in tanh. We implement:
+//   tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+// Clamp input to ±10 so exp(20) stays within float range.
+
+_tanh(float x) =>
+    float cx  = math.max(-10.0, math.min(10.0, x))
+    float e2x = math.exp(2.0 * cx)
+    (e2x - 1.0) / (e2x + 1.0)
+
+// ============================================================================
+// RAW INDICATOR CALCULATIONS
+// ============================================================================
+
+raw_rsi     = ta.rsi(close, i_rsi_len)
+raw_stoch_k = ta.sma(ta.stoch(close, high, low, i_stoch_k_len), i_stoch_k_smooth)
+raw_cci     = ta.cci(close, i_cci_len)
+raw_roc     = ta.roc(close, i_roc_len)
+[macd_line, macd_signal, macd_hist] = ta.macd(close, i_macd_fast, i_macd_slow, i_macd_sig)
+
+// ============================================================================
+// STEP 1 — NORMALIZATION TO [-100, +100]
+// ============================================================================
+
+// RSI (0–100) → linear rescale
+s_rsi = 2.0 * (raw_rsi - 50.0)
+
+// Stochastic %K (0–100) → linear rescale
+s_stoch = 2.0 * (raw_stoch_k - 50.0)
+
+// CCI (unbounded) → tanh squash
+s_cci = 100.0 * _tanh(raw_cci / 100.0)
+
+// ROC (unbounded) → tanh squash with user scaling factor
+s_roc = 100.0 * _tanh(raw_roc / i_roc_scale)
+
+// MACD histogram → z-score then tanh squash
+macd_sd = ta.stdev(macd_hist, i_macd_stdev)
+z_macd  = macd_sd != 0 ? macd_hist / macd_sd : 0.0
+s_macd  = 100.0 * _tanh(z_macd)
+
+// ============================================================================
+// STEP 2 — AGREEMENT-WEIGHTED COMPOSITE
+// ============================================================================
+
+// --- Mean of scores ---
+float mean_s = (s_rsi + s_stoch + s_cci + s_roc + s_macd) / 5.0
+
+// --- Direction ---
+float direction = mean_s > 0 ? 1.0 : mean_s < 0 ? -1.0 : 0.0
+
+// --- Strength: average of absolute values ---
+float strength = (math.abs(s_rsi) + math.abs(s_stoch) + math.abs(s_cci) + math.abs(s_roc) + math.abs(s_macd)) / 5.0
+
+// --- Agreement: count of indicators sharing the direction's sign ---
+int same_count = 0
+same_count += (direction > 0 and s_rsi   > 0) or (direction < 0 and s_rsi   < 0) ? 1 : 0
+same_count += (direction > 0 and s_stoch > 0) or (direction < 0 and s_stoch < 0) ? 1 : 0
+same_count += (direction > 0 and s_cci   > 0) or (direction < 0 and s_cci   < 0) ? 1 : 0
+same_count += (direction > 0 and s_roc   > 0) or (direction < 0 and s_roc   < 0) ? 1 : 0
+same_count += (direction > 0 and s_macd  > 0) or (direction < 0 and s_macd  < 0) ? 1 : 0
+
+float agreement = same_count / 5.0
+
+// --- Composite M based on selected mode ---
+float M_raw = 0.0
+
+if i_mode == "Standard Agreement"
+    M_raw := direction * strength * agreement
+
+else if i_mode == "Confidence Scaled"
+    // Squares agreement to penalize disagreement more heavily
+    M_raw := direction * strength * math.pow(agreement, 2)
+
+else if i_mode == "Majority Rules"
+    // Only output when agreement >= 3/5 (60%), otherwise 0
+    M_raw := agreement >= 0.6 ? direction * strength * agreement : 0.0
+
+else // Unanimous
+    // Only output when all 5 agree (agreement = 1.0)
+    M_raw := agreement >= 1.0 ? direction * strength * agreement : 0.0
+
+// Apply EMA smoothing
+float M = ta.ema(M_raw, i_smooth_len)
+
+// ============================================================================
+// STEP 3 — ZONE CLASSIFICATION
+// ============================================================================
+// |M| > 50  = strong and aligned momentum
+// |M| 20-50 = moderate momentum
+// |M| < 20  = noise/chop
+
+float abs_M    = math.abs(M)
+float abs_M_p  = math.abs(nz(M[1]))
+bool  is_strong   = abs_M > 50
+bool  is_moderate = abs_M >= 20 and abs_M <= 50
+bool  is_chop     = abs_M < 20
+
+// ============================================================================
+// STEP 4 — SIGNALS
+// ============================================================================
+
+// --- Previous direction for consensus shift detection ---
+float prev_mean = nz((s_rsi[1] + s_stoch[1] + s_cci[1] + s_roc[1] + s_macd[1]) / 5.0)
+float prev_dir  = prev_mean > 0 ? 1.0 : prev_mean < 0 ? -1.0 : 0.0
+
+// Strong Aligned: |M| crosses above 50 AND agreement >= threshold (use direction for sign)
+bool sig_strong_aligned = ta.crossover(abs_M, 50.0) and same_count >= i_agree_thresh and direction != 0
+
+// Weakening: |M| drops below 50 (crossunder already implies previous > 50)
+bool sig_weakening = ta.crossunder(abs_M, 50.0)
+
+// Conflict: strength > 40 but agreement < 0.4 (indicators fighting)
+bool sig_conflict = strength > 40.0 and agreement < 0.4
+
+// Consensus Shift: direction flips
+bool sig_consensus_shift = direction != 0 and prev_dir != 0 and direction != prev_dir
+
+// ============================================================================
+// VISUALS — ZONE HLINES & FILLS
+// ============================================================================
+
+h_zero    = hline(0,    "Zero",    color.new(color.gray, 50), linestyle=hline.style_solid)
+h_p20     = hline(20,   "+20",     color.new(i_col_bull, 70), linestyle=hline.style_dotted)
+h_p50     = hline(50,   "+50",     color.new(i_col_bull, 50), linestyle=hline.style_dashed)
+h_n20     = hline(-20,  "-20",     color.new(i_col_bear, 70), linestyle=hline.style_dotted)
+h_n50     = hline(-50,  "-50",     color.new(i_col_bear, 50), linestyle=hline.style_dashed)
+h_top     = hline(100,  "+100",    color.new(color.gray, 90), linestyle=hline.style_dotted)
+h_bottom  = hline(-100, "-100",    color.new(color.gray, 90), linestyle=hline.style_dotted)
+
+fill(h_p50,    h_top,    color.new(i_col_bull, 90), title="Strong Bull Zone")
+fill(h_p20,    h_p50,    color.new(i_col_bull, 93), title="Moderate Bull Zone")
+fill(h_zero,   h_p20,    color.new(i_col_bull, 96), title="Neutral Bull Zone")
+fill(h_n20,    h_zero,   color.new(i_col_bear, 96), title="Neutral Bear Zone")
+fill(h_n50,    h_n20,    color.new(i_col_bear, 93), title="Moderate Bear Zone")
+fill(h_bottom, h_n50,    color.new(i_col_bear, 90), title="Strong Bear Zone")
+
+// ============================================================================
+// VISUALS — MAIN COMPOSITE LINE (color gradient)
+// ============================================================================
+
+composite_color = color.from_gradient(M, -100, 100, i_col_bear, i_col_bull)
+plot(M, "Composite M", color=composite_color, linewidth=3, style=plot.style_line)
+
+// ============================================================================
+// VISUALS — AGREEMENT LINE (scaled 0-100)
+// ============================================================================
+
+plot(i_show_agreement_line ? agreement * 100.0 : na, "Agreement (0–100)",
+     color=color.new(color.white, 40), linewidth=1, style=plot.style_stepline)
+
+// ============================================================================
+// VISUALS — STRENGTH LINE (toggleable)
+// ============================================================================
+
+plot(i_show_strength_line ? strength : na, "Strength",
+     color=color.new(color.yellow, 40), linewidth=1, style=plot.style_line)
+
+// ============================================================================
+// VISUALS — BACKGROUND SHADING (opacity from agreement level)
+// ============================================================================
+// Higher agreement → more opaque background in direction color
+
+bg_agree_alpha = int(95 - agreement * 30)  // agreement 0→α95 (invisible), 1.0→α65 (visible)
+
+color bg_col = na
+if i_show_bg
+    if M > 0
+        bg_col := color.new(i_col_bull, bg_agree_alpha)
+    else if M < 0
+        bg_col := color.new(i_col_bear, bg_agree_alpha)
+    else
+        bg_col := na
+
+bgcolor(bg_col, title="Agreement Background")
+
+// ============================================================================
+// VISUALS — SIGNAL MARKERS
+// ============================================================================
+
+// Strong Aligned — large triangles
+plotshape(i_show_strong_aligned and sig_strong_aligned and direction > 0,
+          title="Strong Aligned Bull", style=shape.triangleup,
+          location=location.bottom, color=i_col_bull, size=size.normal, text="Strong")
+plotshape(i_show_strong_aligned and sig_strong_aligned and direction < 0,
+          title="Strong Aligned Bear", style=shape.triangledown,
+          location=location.top, color=i_col_bear, size=size.normal, text="Strong")
+
+// Weakening — cross marks
+plotshape(i_show_weakening and sig_weakening,
+          title="Weakening", style=shape.xcross,
+          location=location.absolute, price=M, color=color.new(i_col_neutral, 0),
+          size=size.small, text="Weak")
+
+// Conflict warnings — diamonds in conflict color
+plotshape(i_show_conflict and sig_conflict,
+          title="Conflict", style=shape.diamond,
+          location=location.absolute, price=M, color=color.new(i_col_conflict, 0),
+          size=size.small, text="⚡")
+
+// Consensus Shift — arrows
+plotshape(i_show_consensus and sig_consensus_shift and direction > 0,
+          title="Consensus Shift Bull", style=shape.arrowup,
+          location=location.bottom, color=color.new(color.lime, 0),
+          size=size.small, text="Shift")
+plotshape(i_show_consensus and sig_consensus_shift and direction < 0,
+          title="Consensus Shift Bear", style=shape.arrowdown,
+          location=location.top, color=color.new(color.fuchsia, 0),
+          size=size.small, text="Shift")
+
+// ============================================================================
+// VISUALS — INDIVIDUAL INDICATOR DIRECTION DOTS
+// ============================================================================
+// Small colored dots at fixed y-levels showing which indicators are bull/bear
+
+float dot_rsi   = i_show_individual ? -85.0 : na
+float dot_stoch = i_show_individual ? -88.0 : na
+float dot_cci   = i_show_individual ? -91.0 : na
+float dot_roc   = i_show_individual ? -94.0 : na
+float dot_macd  = i_show_individual ? -97.0 : na
+
+plot(dot_rsi,   "RSI Dir",   color=s_rsi   > 0 ? i_col_bull : i_col_bear, linewidth=1, style=plot.style_circles)
+plot(dot_stoch, "Stoch Dir", color=s_stoch > 0 ? i_col_bull : i_col_bear, linewidth=1, style=plot.style_circles)
+plot(dot_cci,   "CCI Dir",   color=s_cci   > 0 ? i_col_bull : i_col_bear, linewidth=1, style=plot.style_circles)
+plot(dot_roc,   "ROC Dir",   color=s_roc   > 0 ? i_col_bull : i_col_bear, linewidth=1, style=plot.style_circles)
+plot(dot_macd,  "MACD Dir",  color=s_macd  > 0 ? i_col_bull : i_col_bear, linewidth=1, style=plot.style_circles)
+
+// ============================================================================
+// VISUALS — AGREEMENT METER (table in top-right)
+// ============================================================================
+
+if i_show_meter and barstate.islast
+    var table meter = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 30),
+                                border_width=1, border_color=color.new(color.gray, 50))
+
+    // Header
+    table.cell(meter, 0, 0, "Indicator", text_color=color.white, text_size=size.small)
+    table.cell(meter, 1, 0, "Direction", text_color=color.white, text_size=size.small)
+
+    // RSI
+    table.cell(meter, 0, 1, "RSI",   text_color=color.white, text_size=size.small)
+    table.cell(meter, 1, 1, s_rsi > 0 ? "Bull" : "Bear",
+               text_color=s_rsi > 0 ? i_col_bull : i_col_bear, text_size=size.small,
+               bgcolor=color.new(s_rsi > 0 ? i_col_bull : i_col_bear, 80))
+
+    // Stochastic
+    table.cell(meter, 0, 2, "Stoch", text_color=color.white, text_size=size.small)
+    table.cell(meter, 1, 2, s_stoch > 0 ? "Bull" : "Bear",
+               text_color=s_stoch > 0 ? i_col_bull : i_col_bear, text_size=size.small,
+               bgcolor=color.new(s_stoch > 0 ? i_col_bull : i_col_bear, 80))
+
+    // CCI
+    table.cell(meter, 0, 3, "CCI",   text_color=color.white, text_size=size.small)
+    table.cell(meter, 1, 3, s_cci > 0 ? "Bull" : "Bear",
+               text_color=s_cci > 0 ? i_col_bull : i_col_bear, text_size=size.small,
+               bgcolor=color.new(s_cci > 0 ? i_col_bull : i_col_bear, 80))
+
+    // ROC
+    table.cell(meter, 0, 4, "ROC",   text_color=color.white, text_size=size.small)
+    table.cell(meter, 1, 4, s_roc > 0 ? "Bull" : "Bear",
+               text_color=s_roc > 0 ? i_col_bull : i_col_bear, text_size=size.small,
+               bgcolor=color.new(s_roc > 0 ? i_col_bull : i_col_bear, 80))
+
+    // MACD
+    table.cell(meter, 0, 5, "MACD",  text_color=color.white, text_size=size.small)
+    table.cell(meter, 1, 5, s_macd > 0 ? "Bull" : "Bear",
+               text_color=s_macd > 0 ? i_col_bull : i_col_bear, text_size=size.small,
+               bgcolor=color.new(s_macd > 0 ? i_col_bull : i_col_bear, 80))
+
+    // Summary row
+    string dir_label = direction > 0 ? "Bull" : direction < 0 ? "Bear" : "Flat"
+    string summary   = str.tostring(same_count) + "/5 " + dir_label
+    color  sum_col   = same_count >= i_agree_thresh ? (direction > 0 ? i_col_bull : i_col_bear) : i_col_neutral
+    table.cell(meter, 0, 6, "AGREE", text_color=color.white, text_size=size.small)
+    table.cell(meter, 1, 6, summary, text_color=sum_col, text_size=size.small,
+               bgcolor=color.new(sum_col, 70))
+
+// ============================================================================
+// END OF AGREEMENT-WEIGHTED COMPOSITE MOMENTUM
+// ============================================================================
