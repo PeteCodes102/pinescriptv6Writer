@@ -164,7 +164,7 @@ s_roc = 100.0 * _tanh(raw_roc / i_roc_scale)
 
 // MACD histogram → z-score then tanh squash
 macd_sd = ta.stdev(macd_hist, i_macd_stdev)
-z_macd  = macd_sd != 0 ? macd_hist / macd_sd : 0.0
+z_macd  = macd_hist / math.max(macd_sd, 1e-10)
 s_macd  = 100.0 * _tanh(z_macd)
 
 // ============================================================================
