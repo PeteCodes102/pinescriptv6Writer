@@ -1,0 +1,390 @@
+//@version=6
+indicator("Z-Score Composite Momentum",
+         shorttitle="ZCM",
+         overlay=false,
+         max_bars_back=500,
+         max_lines_count=10,
+         max_labels_count=20)
+
+// ============================================================================
+// Z-SCORE COMPOSITE MOMENTUM INDICATOR
+// ============================================================================
+// Applies statistical standardization (Z-scores) to 5 momentum indicators
+// (RSI, Stochastic %K, CCI, ROC, MACD histogram), squashes each to [-100,+100]
+// via tanh, then combines them into a single composite reading.
+//
+// Three compositing modes:
+//   1. Equal Weight        — simple average of all 5 z-scored indicators.
+//   2. Group Oscillators   — groups RSI+Stoch as one bucket, then averages
+//                            with CCI, ROC, MACD (avoids double-counting
+//                            bounded oscillators).
+//   3. Adaptive Regime     — weights each indicator by its recent correlation
+//                            with price change; more predictive → higher weight.
+//
+// Z-Score period can be a single global N or individual per indicator.
+//
+// Stdev floor prevents division by near-zero in low-volatility regimes;
+// defaults to the 10th percentile of rolling stdev.
+//
+// Signals:
+//   • Momentum Impulse  — composite crosses ±20.
+//   • Exhaustion Warning — composite beyond ±60 and turning back toward 0.
+//   • Divergence Alert   — individual z-scores diverge (high stdev among 5).
+// ============================================================================
+
+// ============================================================================
+// INPUTS — RAW INDICATOR LENGTHS
+// ============================================================================
+
+i_rsi_len      = input.int(14, "RSI Length", minval=2, group="RSI",
+                           tooltip="Period for Relative Strength Index")
+
+i_stoch_k_len  = input.int(14, "Stochastic %K Length", minval=1, group="Stochastic",
+                           tooltip="Lookback period for raw %K")
+i_stoch_smooth = input.int(3,  "K Smoothing", minval=1, group="Stochastic",
+                           tooltip="SMA smoothing applied to raw %K")
+
+i_cci_len      = input.int(20, "CCI Length", minval=2, group="CCI",
+                           tooltip="Period for Commodity Channel Index")
+
+i_roc_len      = input.int(12, "ROC Length", minval=1, group="ROC",
+                           tooltip="Period for Rate of Change")
+
+i_macd_fast    = input.int(12, "MACD Fast Length", minval=1, group="MACD")
+i_macd_slow    = input.int(26, "MACD Slow Length", minval=1, group="MACD")
+i_macd_sig     = input.int(9,  "MACD Signal Length", minval=1, group="MACD")
+
+// ============================================================================
+// INPUTS — Z-SCORE SETTINGS
+// ============================================================================
+
+i_zscore_n     = input.int(50, "Z-Score Lookback (N)", minval=5, group="Z-Score",
+                           tooltip="Global rolling window for mean/stdev used in z-score calculation")
+i_adv_mode     = input.bool(false, "Advanced: Individual N per Indicator", group="Z-Score",
+                            tooltip="When enabled, each indicator uses its own z-score lookback period")
+i_n_rsi        = input.int(50, "  N — RSI",   minval=5, group="Z-Score")
+i_n_stoch      = input.int(50, "  N — Stoch", minval=5, group="Z-Score")
+i_n_cci        = input.int(50, "  N — CCI",   minval=5, group="Z-Score")
+i_n_roc        = input.int(50, "  N — ROC",   minval=5, group="Z-Score")
+i_n_macd       = input.int(50, "  N — MACD",  minval=5, group="Z-Score")
+
+// ============================================================================
+// INPUTS — STDEV FLOOR
+// ============================================================================
+
+i_stdev_floor  = input.float(0.0, "Manual Stdev Floor", minval=0.0, step=0.01, group="Stdev Floor",
+                             tooltip="Hard minimum stdev value. Set to 0 to use automatic percentile-based floor.")
+i_floor_pctile = input.int(10, "Percentile for Auto Floor", minval=1, maxval=50, group="Stdev Floor",
+                           tooltip="When manual floor is 0, the Nth-percentile of rolling stdev is used as floor")
+
+// ============================================================================
+// INPUTS — COMPOSITE
+// ============================================================================
+
+i_mode         = input.string("Equal Weight", "Compositing Mode",
+                              options=["Equal Weight", "Group Oscillators", "Adaptive Regime"],
+                              group="Composite",
+                              tooltip="Equal Weight = simple avg. Group Oscillators = RSI+Stoch grouped, then avg 4 buckets. Adaptive = weight by correlation with price change.")
+i_smooth_len   = input.int(5, "Composite Smoothing EMA", minval=1, group="Composite",
+                           tooltip="EMA length applied to the final composite value")
+i_adapt_len    = input.int(20, "Adaptive Correlation Lookback", minval=5, group="Composite",
+                           tooltip="Rolling window for correlation with price change (Adaptive mode only)")
+
+// ============================================================================
+// INPUTS — SIGNAL THRESHOLDS
+// ============================================================================
+
+i_impulse_lvl  = input.int(20, "Impulse Level (±)", minval=1, maxval=99, group="Signals",
+                           tooltip="Composite crossing this level triggers a momentum impulse signal")
+i_exhaust_lvl  = input.int(60, "Exhaustion Level (±)", minval=1, maxval=99, group="Signals",
+                           tooltip="Composite beyond this level and turning back triggers exhaustion warning")
+i_diverg_thresh = input.float(30.0, "Divergence Stdev Threshold", minval=1.0, step=1.0, group="Signals",
+                              tooltip="When stdev among the 5 z-scored components exceeds this, a divergence alert fires")
+
+// ============================================================================
+// INPUTS — SIGNAL TOGGLES
+// ============================================================================
+
+i_show_impulse = input.bool(true, "Show Impulse Signals", group="Signal Toggles")
+i_show_exhaust = input.bool(true, "Show Exhaustion Warnings", group="Signal Toggles")
+i_show_diverg  = input.bool(true, "Show Divergence Alerts", group="Signal Toggles")
+
+// ============================================================================
+// INPUTS — VISUALS
+// ============================================================================
+
+i_show_comps   = input.bool(false, "Show Individual Components", group="Visuals",
+                            tooltip="Plot each of the 5 z-scored indicators as separate lines")
+i_show_hist    = input.bool(true,  "Show Histogram", group="Visuals",
+                            tooltip="Column histogram of the composite underneath the main line")
+i_show_bg      = input.bool(true,  "Show Background Shading", group="Visuals")
+i_show_regime  = input.bool(true,  "Show Regime Indicator", group="Visuals",
+                            tooltip="Small label showing High/Low volatility regime based on average stdev of raw indicators")
+i_col_bull     = input.color(color.green, "Bull Color", group="Visuals")
+i_col_bear     = input.color(color.red,   "Bear Color", group="Visuals")
+
+// ============================================================================
+// HELPER — TANH (clamped to avoid overflow)
+// ============================================================================
+// Pine Script v6 has no built-in tanh. We implement:
+//   tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+// Clamp input to ±10 so exp(20) stays within float range.
+
+pine_tanh(float x) =>
+    float e2x = math.exp(2.0 * math.max(-10.0, math.min(10.0, x)))
+    (e2x - 1.0) / (e2x + 1.0)
+
+// ============================================================================
+// HELPER — PERCENTILE-BASED STDEV FLOOR
+// ============================================================================
+// Approximates the Pth-percentile of a rolling stdev series using
+// ta.percentrank. When percentrank <= P the current value is near the
+// floor; we track the lowest stdev seen at or below that rank.
+
+stdev_floor(float sd, int period, int pctile) =>
+    float rank = ta.percentrank(sd, period)
+    // Use the Pth-percentile value as a running floor
+    var float floor_val = sd
+    if not na(rank) and rank <= pctile
+        floor_val := na(floor_val) ? sd : math.min(floor_val, sd)
+    // Ensure floor is positive
+    math.max(floor_val, 1e-10)
+
+// ============================================================================
+// HELPER — APPLY Z-SCORE + TANH SQUASH
+// ============================================================================
+
+zscore_squash(float x, int n, float manual_floor, int pctile) =>
+    float mu = ta.sma(x, n)
+    float sd = ta.stdev(x, n)
+    // Determine effective floor
+    float auto_floor = stdev_floor(sd, n, pctile)
+    float floor_val  = manual_floor > 0 ? manual_floor : auto_floor
+    float safe_sd    = math.max(sd, floor_val)
+    float z          = (x - mu) / safe_sd
+    100.0 * pine_tanh(z)
+
+// ============================================================================
+// RAW INDICATOR CALCULATIONS
+// ============================================================================
+
+// --- RSI ---
+raw_rsi = ta.rsi(close, i_rsi_len)
+
+// --- Stochastic %K (smoothed) ---
+raw_stoch = ta.sma(ta.stoch(close, high, low, i_stoch_k_len), i_stoch_smooth)
+
+// --- CCI ---
+raw_cci = ta.cci(close, i_cci_len)
+
+// --- ROC ---
+raw_roc = ta.roc(close, i_roc_len)
+
+// --- MACD histogram ---
+[_macd_line, _macd_signal, raw_macd_hist] = ta.macd(close, i_macd_fast, i_macd_slow, i_macd_sig)
+
+// ============================================================================
+// Z-SCORE + TANH SQUASH EACH INDICATOR
+// ============================================================================
+// Resolve effective N per indicator (global or individual)
+
+int n_rsi   = i_adv_mode ? i_n_rsi   : i_zscore_n
+int n_stoch = i_adv_mode ? i_n_stoch : i_zscore_n
+int n_cci   = i_adv_mode ? i_n_cci   : i_zscore_n
+int n_roc   = i_adv_mode ? i_n_roc   : i_zscore_n
+int n_macd  = i_adv_mode ? i_n_macd  : i_zscore_n
+
+float s_rsi   = zscore_squash(raw_rsi,       n_rsi,   i_stdev_floor, i_floor_pctile)
+float s_stoch = zscore_squash(raw_stoch,     n_stoch, i_stdev_floor, i_floor_pctile)
+float s_cci   = zscore_squash(raw_cci,       n_cci,   i_stdev_floor, i_floor_pctile)
+float s_roc   = zscore_squash(raw_roc,       n_roc,   i_stdev_floor, i_floor_pctile)
+float s_macd  = zscore_squash(raw_macd_hist, n_macd,  i_stdev_floor, i_floor_pctile)
+
+// ============================================================================
+// COMPOSITE CALCULATION
+// ============================================================================
+
+// --- Price change for Adaptive mode ---
+float price_chg = ta.change(close)
+
+// --- Rolling correlation of each component with price change ---
+float corr_rsi   = ta.correlation(s_rsi,   price_chg, i_adapt_len)
+float corr_stoch = ta.correlation(s_stoch, price_chg, i_adapt_len)
+float corr_cci   = ta.correlation(s_cci,   price_chg, i_adapt_len)
+float corr_roc   = ta.correlation(s_roc,   price_chg, i_adapt_len)
+float corr_macd  = ta.correlation(s_macd,  price_chg, i_adapt_len)
+
+float composite = na
+
+if i_mode == "Equal Weight"
+    composite := (s_rsi + s_stoch + s_cci + s_roc + s_macd) / 5.0
+
+else if i_mode == "Group Oscillators"
+    // Group bounded oscillators (RSI + Stoch) into one bucket
+    float osc_bucket = (s_rsi + s_stoch) / 2.0
+    composite := (osc_bucket + s_cci + s_roc + s_macd) / 4.0
+
+else // Adaptive Regime
+    // Use absolute correlation as weight — more predictive → higher weight
+    float w_rsi   = math.abs(nz(corr_rsi))
+    float w_stoch = math.abs(nz(corr_stoch))
+    float w_cci   = math.abs(nz(corr_cci))
+    float w_roc   = math.abs(nz(corr_roc))
+    float w_macd  = math.abs(nz(corr_macd))
+    float w_total = w_rsi + w_stoch + w_cci + w_roc + w_macd
+    if w_total > 0
+        composite := (w_rsi * s_rsi + w_stoch * s_stoch + w_cci * s_cci +
+                      w_roc * s_roc + w_macd * s_macd) / w_total
+    else
+        composite := (s_rsi + s_stoch + s_cci + s_roc + s_macd) / 5.0
+
+// Apply smoothing EMA
+float M = ta.ema(composite, i_smooth_len)
+
+// ============================================================================
+// REGIME DETECTION — Average Stdev of Raw Indicators
+// ============================================================================
+// High/low volatility regime based on average stdev of the 5 raw indicators.
+
+float sd_rsi   = ta.stdev(raw_rsi,       n_rsi)
+float sd_stoch = ta.stdev(raw_stoch,     n_stoch)
+float sd_cci   = ta.stdev(raw_cci,       n_cci)
+float sd_roc   = ta.stdev(raw_roc,       n_roc)
+float sd_macd  = ta.stdev(raw_macd_hist, n_macd)
+
+// Normalize each stdev by its own rolling mean to make them comparable
+float norm_sd_rsi   = nz(sd_rsi   / ta.sma(sd_rsi,   n_rsi))
+float norm_sd_stoch = nz(sd_stoch / ta.sma(sd_stoch,  n_stoch))
+float norm_sd_cci   = nz(sd_cci   / ta.sma(sd_cci,    n_cci))
+float norm_sd_roc   = nz(sd_roc   / ta.sma(sd_roc,    n_roc))
+float norm_sd_macd  = nz(sd_macd  / ta.sma(sd_macd,   n_macd))
+
+float avg_norm_sd = (norm_sd_rsi + norm_sd_stoch + norm_sd_cci + norm_sd_roc + norm_sd_macd) / 5.0
+bool  high_vol    = avg_norm_sd > 1.0
+
+// ============================================================================
+// SIGNALS
+// ============================================================================
+
+// --- Momentum Impulse: composite crosses ±impulse level ---
+bool impulse_bull = ta.crossover(M,  i_impulse_lvl)
+bool impulse_bear = ta.crossunder(M, -i_impulse_lvl)
+
+// --- Exhaustion Warning: beyond ±exhaust level and turning back ---
+bool exhaust_bull = M > i_exhaust_lvl  and M < M[1]
+bool exhaust_bear = M < -i_exhaust_lvl and M > M[1]
+
+// --- Z-Score Divergence: high stdev among the 5 squashed components ---
+float comp_mean = (s_rsi + s_stoch + s_cci + s_roc + s_macd) / 5.0
+float comp_var  = (math.pow(s_rsi - comp_mean, 2) +
+                   math.pow(s_stoch - comp_mean, 2) +
+                   math.pow(s_cci - comp_mean, 2) +
+                   math.pow(s_roc - comp_mean, 2) +
+                   math.pow(s_macd - comp_mean, 2)) / 5.0
+float comp_sd   = math.sqrt(comp_var)
+bool  divergence = comp_sd > i_diverg_thresh
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(impulse_bull, title="Bullish Impulse",   message="ZCM: Bullish momentum impulse — composite crossed above +" + str.tostring(i_impulse_lvl))
+alertcondition(impulse_bear, title="Bearish Impulse",   message="ZCM: Bearish momentum impulse — composite crossed below -" + str.tostring(i_impulse_lvl))
+alertcondition(exhaust_bull, title="Bull Exhaustion",    message="ZCM: Bullish exhaustion warning — composite turning down from above +" + str.tostring(i_exhaust_lvl))
+alertcondition(exhaust_bear, title="Bear Exhaustion",    message="ZCM: Bearish exhaustion warning — composite turning up from below -" + str.tostring(i_exhaust_lvl))
+alertcondition(divergence,   title="Component Divergence", message="ZCM: High divergence among z-scored components")
+
+// ============================================================================
+// VISUALS — ZONE HLINES & FILLS (5 colored zones)
+// ============================================================================
+
+h_top          = hline(100,                "+100",        color.new(color.gray, 90),   linestyle=hline.style_dotted)
+h_upper_strong = hline(i_exhaust_lvl,      "+Exhaust",    color.new(i_col_bull, 50),   linestyle=hline.style_dashed)
+h_upper_mild   = hline(i_impulse_lvl,      "+Impulse",    color.new(i_col_bull, 70),   linestyle=hline.style_dotted)
+h_zero         = hline(0,                  "Zero",        color.new(color.gray, 50),   linestyle=hline.style_solid)
+h_lower_mild   = hline(-i_impulse_lvl,     "-Impulse",    color.new(i_col_bear, 70),   linestyle=hline.style_dotted)
+h_lower_strong = hline(-i_exhaust_lvl,     "-Exhaust",    color.new(i_col_bear, 50),   linestyle=hline.style_dashed)
+h_bottom       = hline(-100,               "-100",        color.new(color.gray, 90),   linestyle=hline.style_dotted)
+
+// Zone fills — strong bull → neutral → strong bear
+fill(h_upper_strong, h_top,          color.new(i_col_bull, 88), title="Strong Bull Zone")
+fill(h_upper_mild,   h_upper_strong, color.new(i_col_bull, 92), title="Mild Bull Zone")
+fill(h_zero,         h_upper_mild,   color.new(i_col_bull, 96), title="Neutral Bull Zone")
+fill(h_lower_mild,   h_zero,         color.new(i_col_bear, 96), title="Neutral Bear Zone")
+fill(h_lower_strong, h_lower_mild,   color.new(i_col_bear, 92), title="Mild Bear Zone")
+fill(h_bottom,       h_lower_strong, color.new(i_col_bear, 88), title="Strong Bear Zone")
+
+// ============================================================================
+// VISUALS — HISTOGRAM (composite as columns with gradient color)
+// ============================================================================
+
+hist_color = color.from_gradient(M, -100, 100, color.new(i_col_bear, 40), color.new(i_col_bull, 40))
+plot(i_show_hist ? M : na, "Histogram", color=hist_color, style=plot.style_columns, linewidth=1)
+
+// ============================================================================
+// VISUALS — MAIN COMPOSITE LINE (color gradient bull → bear)
+// ============================================================================
+
+line_color = color.from_gradient(M, -100, 100, i_col_bear, i_col_bull)
+plot(M, "Composite", color=line_color, linewidth=3, style=plot.style_line)
+
+// ============================================================================
+// VISUALS — INDIVIDUAL COMPONENTS (toggleable)
+// ============================================================================
+
+plot(i_show_comps ? s_rsi   : na, "s_RSI",   color=color.new(color.blue, 40),   linewidth=1)
+plot(i_show_comps ? s_stoch : na, "s_Stoch", color=color.new(color.purple, 40), linewidth=1)
+plot(i_show_comps ? s_cci   : na, "s_CCI",   color=color.new(color.orange, 40), linewidth=1)
+plot(i_show_comps ? s_roc   : na, "s_ROC",   color=color.new(color.teal, 40),   linewidth=1)
+plot(i_show_comps ? s_macd  : na, "s_MACD",  color=color.new(color.yellow, 40), linewidth=1)
+
+// ============================================================================
+// VISUALS — SIGNAL MARKERS
+// ============================================================================
+
+// Momentum Impulse — triangles
+plotshape(i_show_impulse and impulse_bull, title="Impulse Bull", style=shape.triangleup,
+          location=location.bottom, color=i_col_bull, size=size.small, text="▲")
+plotshape(i_show_impulse and impulse_bear, title="Impulse Bear", style=shape.triangledown,
+          location=location.top, color=i_col_bear, size=size.small, text="▼")
+
+// Exhaustion Warning — diamonds
+plotshape(i_show_exhaust and exhaust_bull, title="Exhaust Bull", style=shape.diamond,
+          location=location.absolute, price=M, color=color.new(color.orange, 0),
+          size=size.tiny, text="X")
+plotshape(i_show_exhaust and exhaust_bear, title="Exhaust Bear", style=shape.diamond,
+          location=location.absolute, price=M, color=color.new(color.orange, 0),
+          size=size.tiny, text="X")
+
+// Divergence Alert — circles
+plotshape(i_show_diverg and divergence, title="Divergence", style=shape.circle,
+          location=location.absolute, price=M, color=color.new(color.fuchsia, 0),
+          size=size.tiny, text="D")
+
+// ============================================================================
+// VISUALS — BACKGROUND SHADING (zone-based)
+// ============================================================================
+
+bg_col = M > i_exhaust_lvl       ? color.new(i_col_bull, 85) :
+         M > i_impulse_lvl       ? color.new(i_col_bull, 92) :
+         M < -i_exhaust_lvl      ? color.new(i_col_bear, 85) :
+         M < -i_impulse_lvl      ? color.new(i_col_bear, 92) :
+         color.new(color.gray, 97)
+
+bgcolor(i_show_bg ? bg_col : na, title="Zone Background")
+
+// ============================================================================
+// VISUALS — REGIME INDICATOR LABEL
+// ============================================================================
+
+if i_show_regime and barstate.islast
+    string regime_txt = high_vol ? "HIGH VOL" : "LOW VOL"
+    color  regime_col = high_vol ? color.orange : color.gray
+    label.new(bar_index + 2, 90, regime_txt,
+              style=label.style_label_left, color=color.new(regime_col, 20),
+              textcolor=color.white, size=size.small,
+              tooltip="Avg normalized stdev of raw indicators: " + str.tostring(avg_norm_sd, "#.##"))
+
+// ============================================================================
+// END OF Z-SCORE COMPOSITE MOMENTUM INDICATOR
+// ============================================================================
