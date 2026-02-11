@@ -1,0 +1,378 @@
+//@version=6
+indicator("Strength Trend Indicator — Composite Momentum", 
+         shorttitle="STI", 
+         overlay=false, 
+         max_bars_back=500,
+         max_lines_count=10,
+         max_labels_count=10)
+
+// ============================================================================
+// STRENGTH TREND INDICATOR
+// ============================================================================
+// Normalizes 5 momentum indicators (RSI, Stochastic %K, CCI, ROC, MACD)
+// to a common -100 to +100 scale, then averages them into a single composite.
+//
+// Three averaging modes:
+//   1. Simple Average — straight mean of all 5.
+//   2. Weighted (Group Oscillators) — groups RSI+Stoch, then averages
+//      with CCI, ROC, MACD (avoids double-counting bounded oscillators).
+//   3. Custom Weights — user sets individual weights per component.
+//
+// Threshold modes:
+//   • Fixed Zones   — static ±20 / ±60 levels.
+//   • Dynamic Percentile — rolling 80th / 20th percentile over N bars.
+//
+// Signals:
+//   • Momentum Impulse — composite crosses ±20.
+//   • Exhaustion Watch — composite beyond ±60 AND turning back toward 0.
+// ============================================================================
+
+// ============================================================================
+// INPUTS — RSI
+// ============================================================================
+
+i_rsi_len = input.int(14, "RSI Length", minval=2, group="RSI",
+                      tooltip="Period for Relative Strength Index calculation")
+
+// ============================================================================
+// INPUTS — STOCHASTIC
+// ============================================================================
+
+i_stoch_k_len = input.int(14, "Stochastic %K Length", minval=1, group="Stochastic",
+                          tooltip="Lookback period for raw %K")
+i_stoch_k_smooth = input.int(3, "K Smoothing", minval=1, group="Stochastic",
+                             tooltip="SMA smoothing applied to raw %K")
+i_stoch_d_smooth = input.int(3, "D Smoothing", minval=1, group="Stochastic",
+                             tooltip="SMA smoothing applied to %K to produce %D")
+
+// ============================================================================
+// INPUTS — CCI
+// ============================================================================
+
+i_cci_len = input.int(20, "CCI Length", minval=2, group="CCI",
+                      tooltip="Period for Commodity Channel Index calculation")
+
+// ============================================================================
+// INPUTS — ROC
+// ============================================================================
+
+i_roc_len = input.int(12, "ROC Length", minval=1, group="ROC",
+                      tooltip="Period for Rate of Change calculation")
+i_roc_scale = input.float(5.0, "ROC Scaling Factor (r)", minval=0.1, step=0.5, group="ROC",
+                          tooltip="Divisor used to scale ROC before tanh squash. Smaller = more sensitive")
+
+// ============================================================================
+// INPUTS — MACD
+// ============================================================================
+
+i_macd_fast = input.int(12, "MACD Fast Length", minval=1, group="MACD")
+i_macd_slow = input.int(26, "MACD Slow Length", minval=1, group="MACD")
+i_macd_sig  = input.int(9, "MACD Signal Length", minval=1, group="MACD")
+i_macd_stdev = input.int(20, "MACD Stdev Norm Period", minval=2, group="MACD",
+                         tooltip="Rolling window for z-score normalization of MACD histogram")
+
+// ============================================================================
+// INPUTS — COMPOSITE
+// ============================================================================
+
+i_smooth_len = input.int(5, "Composite Smoothing EMA", minval=1, group="Composite",
+                         tooltip="EMA length applied to the final composite value")
+i_mode = input.string("Weighted (Group Oscillators)", "Averaging Mode",
+                      options=["Simple Average", "Weighted (Group Oscillators)", "Custom Weights"],
+                      group="Composite",
+                      tooltip="Simple = equal weight all 5. Weighted = groups RSI+Stoch then averages 4 buckets. Custom = you set weights.")
+
+// ============================================================================
+// INPUTS — CUSTOM WEIGHTS
+// ============================================================================
+
+i_w_rsi   = input.float(1.0, "Weight: RSI",   minval=0, step=0.1, group="Custom Weights",
+                        tooltip="Only used when mode = Custom Weights")
+i_w_stoch = input.float(1.0, "Weight: Stochastic", minval=0, step=0.1, group="Custom Weights")
+i_w_cci   = input.float(1.0, "Weight: CCI",   minval=0, step=0.1, group="Custom Weights")
+i_w_roc   = input.float(1.0, "Weight: ROC",   minval=0, step=0.1, group="Custom Weights")
+i_w_macd  = input.float(1.0, "Weight: MACD",  minval=0, step=0.1, group="Custom Weights")
+
+// ============================================================================
+// INPUTS — THRESHOLDS
+// ============================================================================
+
+i_thresh_mode = input.string("Fixed Zones", "Threshold Mode",
+                             options=["Fixed Zones", "Dynamic Percentile"],
+                             group="Thresholds",
+                             tooltip="Fixed = ±20/±60 static lines. Dynamic = rolling percentile bands.")
+i_pct_len = input.int(200, "Percentile Lookback", minval=20, group="Thresholds",
+                      tooltip="Bar count for rolling percentile calculation (Dynamic mode)")
+
+// ============================================================================
+// INPUTS — VISUALS
+// ============================================================================
+
+i_show_components = input.bool(false, "Show Individual Components", group="Visuals",
+                               tooltip="Plot s_rsi, s_stoch, s_cci, s_roc, s_macd as separate lines")
+i_show_signals    = input.bool(true, "Show Signal Markers", group="Visuals")
+i_show_bg         = input.bool(true, "Show Background Shading", group="Visuals")
+i_show_agreement  = input.bool(true, "Show Agreement Count", group="Visuals",
+                               tooltip="Display how many of the 5 indicators share the same sign")
+i_col_bull = input.color(color.green, "Bull Color", group="Visuals")
+i_col_bear = input.color(color.red,   "Bear Color", group="Visuals")
+
+// ============================================================================
+// HELPER — TANH APPROXIMATION (clamped to avoid overflow)
+// ============================================================================
+// Pine Script v6 has no built-in tanh. We implement:
+//   tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+// Clamp input to ±10 so exp(20) stays within float range.
+
+_tanh(float x) =>
+    float cx = math.max(-10.0, math.min(10.0, x))
+    float e2x = math.exp(2.0 * cx)
+    (e2x - 1.0) / (e2x + 1.0)
+
+// ============================================================================
+// RAW INDICATOR CALCULATIONS
+// ============================================================================
+
+// --- RSI ---
+raw_rsi = ta.rsi(close, i_rsi_len)
+
+// --- Stochastic %K (smoothed) ---
+raw_stoch_k = ta.sma(ta.stoch(close, high, low, i_stoch_k_len), i_stoch_k_smooth)
+
+// --- CCI ---
+raw_cci = ta.cci(close, i_cci_len)
+
+// --- ROC ---
+raw_roc = ta.roc(close, i_roc_len)
+
+// --- MACD ---
+[macd_line, macd_signal, macd_hist] = ta.macd(close, i_macd_fast, i_macd_slow, i_macd_sig)
+
+// ============================================================================
+// STEP 1 — NORMALIZATION TO -100 … +100
+// ============================================================================
+
+// RSI (0–100) → linear rescale
+s_rsi = 2.0 * (raw_rsi - 50.0)
+
+// Stochastic %K (0–100) → linear rescale
+s_stoch = 2.0 * (raw_stoch_k - 50.0)
+
+// CCI (unbounded) → tanh squash
+s_cci = 100.0 * _tanh(raw_cci / 100.0)
+
+// ROC (unbounded) → tanh squash with user scaling factor
+s_roc = 100.0 * _tanh(raw_roc / i_roc_scale)
+
+// MACD histogram → z-score then tanh squash
+macd_sd = ta.stdev(macd_hist, i_macd_stdev)
+z_macd  = macd_hist / math.max(macd_sd, 1e-10)
+s_macd  = 100.0 * _tanh(z_macd)
+
+// ============================================================================
+// STEP 2 — COMPOSITE CALCULATION
+// ============================================================================
+
+float composite = na
+
+if i_mode == "Simple Average"
+    // Straight mean of all 5 normalized scores
+    composite := (s_rsi + s_stoch + s_cci + s_roc + s_macd) / 5.0
+
+else if i_mode == "Weighted (Group Oscillators)"
+    // Group bounded oscillators to avoid double-counting RSI + Stoch
+    float osc = (s_rsi + s_stoch) / 2.0
+    composite := (osc + s_macd + s_cci + s_roc) / 4.0
+
+else // Custom Weights
+    float total_w = i_w_rsi + i_w_stoch + i_w_cci + i_w_roc + i_w_macd
+    float wsum = i_w_rsi * s_rsi + i_w_stoch * s_stoch + i_w_cci * s_cci +
+                 i_w_roc * s_roc + i_w_macd * s_macd
+    composite := total_w > 0 ? wsum / total_w : 0.0
+
+// Apply EMA smoothing
+float M_smooth = ta.ema(composite, i_smooth_len)
+
+// ============================================================================
+// STEP 3 — THRESHOLD LEVELS
+// ============================================================================
+// Fixed zones: ±20 (mild) and ±60 (strong).
+// Dynamic percentile: rolling 80th and 20th percentile of composite.
+
+// Rolling percentile via percentrank — find the value at the Pth percentile
+// ta.percentrank gives the rank of the current value, so we use a helper:
+// Sort approach is not native; approximate with highest/lowest + percentrank.
+// We'll use the composite's own percentrank to determine dynamic thresholds.
+
+var float dyn_upper_strong = 60.0
+var float dyn_upper_mild   = 20.0
+var float dyn_lower_mild   = -20.0
+var float dyn_lower_strong = -60.0
+
+if i_thresh_mode == "Dynamic Percentile"
+    // Approximate percentile thresholds using rolling highest/lowest and percentrank
+    float hi = ta.highest(M_smooth, i_pct_len)
+    float lo = ta.lowest(M_smooth, i_pct_len)
+    float range_val = hi - lo
+    if range_val > 0
+        dyn_upper_strong := lo + range_val * 0.80
+        dyn_upper_mild   := lo + range_val * 0.60
+        dyn_lower_mild   := lo + range_val * 0.40
+        dyn_lower_strong := lo + range_val * 0.20
+else
+    dyn_upper_strong := 60.0
+    dyn_upper_mild   := 20.0
+    dyn_lower_mild   := -20.0
+    dyn_lower_strong := -60.0
+
+// Select active thresholds
+float th_upper_strong = dyn_upper_strong
+float th_upper_mild   = dyn_upper_mild
+float th_lower_mild   = dyn_lower_mild
+float th_lower_strong = dyn_lower_strong
+
+// ============================================================================
+// STEP 4 — SIGNALS
+// ============================================================================
+
+// --- Momentum Impulse ---
+// Bull impulse: composite crosses above upper mild threshold
+// Bear impulse: composite crosses below lower mild threshold
+bool impulse_bull = ta.crossover(M_smooth, th_upper_mild)
+bool impulse_bear = ta.crossunder(M_smooth, th_lower_mild)
+
+// --- Exhaustion Watch ---
+// Beyond ±60 AND turning back toward 0 (composite started declining / rising)
+bool in_strong_bull = M_smooth > th_upper_strong
+bool in_strong_bear = M_smooth < th_lower_strong
+bool turning_down   = M_smooth < M_smooth[1]
+bool turning_up     = M_smooth > M_smooth[1]
+
+bool exhaust_bull = in_strong_bull and turning_down
+bool exhaust_bear = in_strong_bear and turning_up
+
+// ============================================================================
+// STEP 5 — AGREEMENT COUNT
+// ============================================================================
+// How many of the 5 indicators share the same sign as the composite.
+
+int agree_bull = 0
+int agree_bear = 0
+
+agree_bull += s_rsi   > 0 ? 1 : 0
+agree_bull += s_stoch > 0 ? 1 : 0
+agree_bull += s_cci   > 0 ? 1 : 0
+agree_bull += s_roc   > 0 ? 1 : 0
+agree_bull += s_macd  > 0 ? 1 : 0
+
+agree_bear += s_rsi   < 0 ? 1 : 0
+agree_bear += s_stoch < 0 ? 1 : 0
+agree_bear += s_cci   < 0 ? 1 : 0
+agree_bear += s_roc   < 0 ? 1 : 0
+agree_bear += s_macd  < 0 ? 1 : 0
+
+int agreement = M_smooth >= 0 ? agree_bull : agree_bear
+
+// ============================================================================
+// VISUALS — ZONE HLINES & FILLS
+// ============================================================================
+
+h_zero        = hline(0,    "Zero",         color.new(color.gray, 50),  linestyle=hline.style_solid)
+h_upper_mild  = hline(20,   "+20 Mild",     color.new(i_col_bull, 70),  linestyle=hline.style_dotted)
+h_upper_strong = hline(60,  "+60 Strong",   color.new(i_col_bull, 50),  linestyle=hline.style_dashed)
+h_lower_mild  = hline(-20,  "-20 Mild",     color.new(i_col_bear, 70),  linestyle=hline.style_dotted)
+h_lower_strong = hline(-60, "-60 Strong",   color.new(i_col_bear, 50),  linestyle=hline.style_dashed)
+h_top         = hline(100,  "+100",         color.new(color.gray, 90),  linestyle=hline.style_dotted)
+h_bottom      = hline(-100, "-100",         color.new(color.gray, 90),  linestyle=hline.style_dotted)
+
+// Zone fills — layered transparency
+fill(h_upper_strong, h_top,          color.new(i_col_bull, 90), title="Strong Bull Zone")
+fill(h_upper_mild,   h_upper_strong, color.new(i_col_bull, 93), title="Mild Bull Zone")
+fill(h_zero,         h_upper_mild,   color.new(i_col_bull, 96), title="Neutral Bull Zone")
+fill(h_lower_mild,   h_zero,         color.new(i_col_bear, 96), title="Neutral Bear Zone")
+fill(h_lower_strong, h_lower_mild,   color.new(i_col_bear, 93), title="Mild Bear Zone")
+fill(h_bottom,       h_lower_strong, color.new(i_col_bear, 90), title="Strong Bear Zone")
+
+// ============================================================================
+// VISUALS — MAIN COMPOSITE LINE (color gradient)
+// ============================================================================
+
+composite_color = color.from_gradient(M_smooth, -100, 100, i_col_bear, i_col_bull)
+plot(M_smooth, "Composite", color=composite_color, linewidth=3, style=plot.style_line)
+
+// ============================================================================
+// VISUALS — DYNAMIC THRESHOLD LINES (only in Dynamic Percentile mode)
+// ============================================================================
+
+plot(i_thresh_mode == "Dynamic Percentile" ? dyn_upper_strong : na, "Dyn +Strong",
+     color=color.new(i_col_bull, 40), linewidth=1, style=plot.style_stepline)
+plot(i_thresh_mode == "Dynamic Percentile" ? dyn_upper_mild : na, "Dyn +Mild",
+     color=color.new(i_col_bull, 60), linewidth=1, style=plot.style_stepline)
+plot(i_thresh_mode == "Dynamic Percentile" ? dyn_lower_mild : na, "Dyn -Mild",
+     color=color.new(i_col_bear, 60), linewidth=1, style=plot.style_stepline)
+plot(i_thresh_mode == "Dynamic Percentile" ? dyn_lower_strong : na, "Dyn -Strong",
+     color=color.new(i_col_bear, 40), linewidth=1, style=plot.style_stepline)
+
+// ============================================================================
+// VISUALS — SUB-INDICATOR LINES (toggleable)
+// ============================================================================
+
+plot(i_show_components ? s_rsi   : na, "s_RSI",   color=color.new(color.blue, 40),   linewidth=1)
+plot(i_show_components ? s_stoch : na, "s_Stoch", color=color.new(color.purple, 40), linewidth=1)
+plot(i_show_components ? s_cci   : na, "s_CCI",   color=color.new(color.orange, 40), linewidth=1)
+plot(i_show_components ? s_roc   : na, "s_ROC",   color=color.new(color.teal, 40),   linewidth=1)
+plot(i_show_components ? s_macd  : na, "s_MACD",  color=color.new(color.yellow, 40), linewidth=1)
+
+// ============================================================================
+// VISUALS — SIGNAL MARKERS
+// ============================================================================
+
+// Momentum Impulse — triangles
+plotshape(i_show_signals and impulse_bull, title="Impulse Bull", style=shape.triangleup,
+          location=location.bottom, color=i_col_bull, size=size.small, text="▲")
+plotshape(i_show_signals and impulse_bear, title="Impulse Bear", style=shape.triangledown,
+          location=location.top, color=i_col_bear, size=size.small, text="▼")
+
+// Exhaustion Watch — diamonds
+plotshape(i_show_signals and exhaust_bull, title="Exhaust Bull", style=shape.diamond,
+          location=location.absolute, price=M_smooth, color=color.new(color.orange, 0),
+          size=size.tiny, text="X")
+plotshape(i_show_signals and exhaust_bear, title="Exhaust Bear", style=shape.diamond,
+          location=location.absolute, price=M_smooth, color=color.new(color.orange, 0),
+          size=size.tiny, text="X")
+
+// ============================================================================
+// VISUALS — BACKGROUND SHADING
+// ============================================================================
+
+bg_col = M_smooth > th_upper_strong ? color.new(i_col_bull, 85) :
+         M_smooth > th_upper_mild   ? color.new(i_col_bull, 92) :
+         M_smooth < th_lower_strong ? color.new(i_col_bear, 85) :
+         M_smooth < th_lower_mild   ? color.new(i_col_bear, 92) :
+         color.new(color.gray, 97)
+
+bgcolor(i_show_bg ? bg_col : na, title="Zone Background")
+
+// ============================================================================
+// VISUALS — AGREEMENT COUNT LABEL
+// ============================================================================
+
+if i_show_agreement and barstate.islast
+    string dir_txt = M_smooth >= 0 ? "bull" : "bear"
+    string lbl_txt = str.tostring(agreement) + "/5 " + dir_txt
+    color  lbl_col = agreement >= 4 ? (M_smooth >= 0 ? i_col_bull : i_col_bear) : color.gray
+    label.new(bar_index, M_smooth, lbl_txt, 
+              style=label.style_label_left, color=color.new(lbl_col, 20),
+              textcolor=color.white, size=size.normal)
+
+// ============================================================================
+// VISUALS — AGREEMENT COUNT PLOT (continuous)
+// ============================================================================
+
+// Scale agreement to fit the indicator pane: map 0–5 to 0–100
+plot(i_show_agreement ? agreement * 20.0 : na, "Agreement (scaled)",
+     color=color.new(color.white, 60), linewidth=1, style=plot.style_stepline)
+
+// ============================================================================
+// END OF STRENGTH TREND INDICATOR
+// ============================================================================
