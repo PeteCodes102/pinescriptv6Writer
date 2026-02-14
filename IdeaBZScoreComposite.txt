@@ -288,10 +288,10 @@ bool  divergence = comp_sd > i_diverg_thresh
 // ALERTS
 // ============================================================================
 
-alertcondition(impulse_bull, title="Bullish Impulse",   message="ZCM: Bullish momentum impulse — composite crossed above +" + str.tostring(i_impulse_lvl))
-alertcondition(impulse_bear, title="Bearish Impulse",   message="ZCM: Bearish momentum impulse — composite crossed below -" + str.tostring(i_impulse_lvl))
-alertcondition(exhaust_bull, title="Bull Exhaustion",    message="ZCM: Bullish exhaustion warning — composite turning down from above +" + str.tostring(i_exhaust_lvl))
-alertcondition(exhaust_bear, title="Bear Exhaustion",    message="ZCM: Bearish exhaustion warning — composite turning up from below -" + str.tostring(i_exhaust_lvl))
+alertcondition(impulse_bull, title="Bullish Impulse",   message="ZCM: Bullish momentum impulse — composite crossed above impulse level")
+alertcondition(impulse_bear, title="Bearish Impulse",   message="ZCM: Bearish momentum impulse — composite crossed below impulse level")
+alertcondition(exhaust_bull, title="Bull Exhaustion",    message="ZCM: Bullish exhaustion warning — composite turning down from above exhaustion level")
+alertcondition(exhaust_bear, title="Bear Exhaustion",    message="ZCM: Bearish exhaustion warning — composite turning up from below exhaustion level")
 alertcondition(divergence,   title="Component Divergence", message="ZCM: High divergence among z-scored components")
 
 // ============================================================================

@@ -483,10 +483,10 @@ if i_show_dashboard and barstate.islast
 // ============================================================================
 
 alertcondition(i_alert_long and final_go_long, title="Go Long",
-               message="Engine Meter: GO LONG — M crossed above +" + str.tostring(i_m_thresh) + " with Q above quality threshold")
+               message="Engine Meter: GO LONG — M crossed above momentum threshold with Q above quality threshold")
 
 alertcondition(i_alert_short and final_go_short, title="Go Short",
-               message="Engine Meter: GO SHORT — M crossed below -" + str.tostring(i_m_thresh) + " with Q above quality threshold")
+               message="Engine Meter: GO SHORT — M crossed below momentum threshold with Q above quality threshold")
 
 alertcondition(i_alert_fade_l and final_fade_long, title="Exit/Fade Long",
                message="Engine Meter: FADE LONG — M extreme positive with Q collapsing (mean-revert setup)")
