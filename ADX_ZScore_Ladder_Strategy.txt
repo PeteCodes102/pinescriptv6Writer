@@ -107,21 +107,22 @@ showTable = input.bool(true, "Show Info Table", group="Visuals")
 // Function to calculate z-score of ADX for a given timeframe
 // Returns [zADX, zSlope, longBias, shortBias, rawADX]
 f_zADX(simple string tf, simple int adxLength, simple int zWindow) =>
-    // Calculate in native timeframe context to avoid normalization distortion
-    [plusDI, minusDI, adx] = request.security(syminfo.tickerid, tf, 
-         [ta.dmi(adxLength, adxLength)[0], ta.dmi(adxLength, adxLength)[1], ta.adx(adxLength)],
+    // Calculate ALL metrics in native timeframe context to avoid normalization distortion
+    // This is critical: z-score MUST be computed on the native TF bars
+    [plusDI, minusDI, adx, mean, stdev, zADX, zSlope, longBias, shortBias] = request.security(syminfo.tickerid, tf, 
+         [
+             ta.dmi(adxLength, adxLength)[0], 
+             ta.dmi(adxLength, adxLength)[1], 
+             ta.adx(adxLength),
+             ta.sma(ta.adx(adxLength), zWindow),
+             ta.stdev(ta.adx(adxLength), zWindow),
+             (ta.adx(adxLength) - ta.sma(ta.adx(adxLength), zWindow)) / math.max(ta.stdev(ta.adx(adxLength), zWindow), 0.0001),
+             ((ta.adx(adxLength) - ta.sma(ta.adx(adxLength), zWindow)) / math.max(ta.stdev(ta.adx(adxLength), zWindow), 0.0001)) - 
+             ((ta.adx(adxLength) - ta.sma(ta.adx(adxLength), zWindow)) / math.max(ta.stdev(ta.adx(adxLength), zWindow), 0.0001))[1],
+             ta.dmi(adxLength, adxLength)[0] > ta.dmi(adxLength, adxLength)[1],
+             ta.dmi(adxLength, adxLength)[1] > ta.dmi(adxLength, adxLength)[0]
+         ],
          lookahead=barmerge.lookahead_off)
-    
-    // Direction bias
-    longBias = plusDI > minusDI
-    shortBias = minusDI > plusDI
-    
-    // Z-score calculation in native TF
-    mean = ta.sma(adx, zWindow)
-    stdev = ta.stdev(adx, zWindow)
-    stdev_clamped = math.max(stdev, 0.0001)  // Floor to avoid division by zero
-    zADX = (adx - mean) / stdev_clamped
-    zSlope = zADX - zADX[1]
     
     [zADX, zSlope, longBias, shortBias, adx]
 
