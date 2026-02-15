@@ -1,0 +1,533 @@
+//@version=6
+strategy("Multi-TF ADX Z-Score Ladder", 
+         overlay=true, 
+         process_orders_on_close=true,
+         initial_capital=50000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=100,
+         pyramiding=0)
+
+// ============================================================================
+// 1) SCRIPT SETTINGS & COMMISSION/SLIPPAGE
+// ============================================================================
+commissionPct = input.float(0.04, "Commission %", minval=0, maxval=5, group="Settings") / 100
+slippageTicks = input.int(2, "Slippage (ticks)", minval=0, group="Settings")
+
+// Apply commission and slippage
+strategy.risk.allow_entry_in(strategy.direction.all)
+
+// ============================================================================
+// 2) TIMEFRAME LADDER INPUTS
+// ============================================================================
+tf_entry = input.timeframe("5", "Entry Timeframe", group="Timeframe Ladder")
+tf_trigger = input.timeframe("15", "Trigger Timeframe", group="Timeframe Ladder")
+tf_regime = input.timeframe("60", "Regime Timeframe", group="Timeframe Ladder")
+tf_backdrop = input.timeframe("240", "Backdrop Timeframe (4H)", group="Timeframe Ladder")
+
+// ============================================================================
+// 3) ADX + DI SETTINGS
+// ============================================================================
+adxLen = input.int(14, "ADX Length", minval=1, group="ADX/DI")
+
+// Z-score window inputs
+zWin_entry = input.int(200, "Z-Window Entry (5m)", minval=10, group="Z-Score")
+zWin_trigger = input.int(160, "Z-Window Trigger (15m)", minval=10, group="Z-Score")
+zWin_regime = input.int(120, "Z-Window Regime (60m)", minval=10, group="Z-Score")
+zWin_backdrop = input.int(80, "Z-Window Backdrop (240m)", minval=10, group="Z-Score")
+
+// ============================================================================
+// 4) MODE THRESHOLD INPUTS
+// ============================================================================
+zTrendCapable = input.float(0.0, "Z-Trend Capable (Backdrop)", group="Mode Thresholds")
+zRegimeOn = input.float(0.3, "Z-Regime Active", group="Mode Thresholds")
+zWeakChop = input.float(-0.3, "Z-Weak Chop (Backdrop)", group="Mode Thresholds")
+zTriggerMin = input.float(-0.2, "Z-Trigger Min", group="Mode Thresholds")
+zExitWeak = input.float(-0.2, "Z-Exit Weak", group="Mode Thresholds")
+slopeBarsExit = input.int(3, "Slope Bars Exit Count", minval=1, group="Mode Thresholds")
+
+allowMixedMode = input.bool(true, "Allow Mixed Mode", group="Mode Thresholds")
+
+// ============================================================================
+// 5) ENTRY STYLE SELECTION
+// ============================================================================
+entryStyle = input.string("EMA Pullback / Reclaim", "Entry Style", 
+                          options=["EMA Pullback / Reclaim", "Break + Retest (Pivot)", "Simple Market (Permission Only)"],
+                          group="Entry Settings")
+
+// EMA Settings
+emaFastLen = input.int(20, "EMA Fast Length", minval=1, group="Entry Settings")
+emaSlowLen = input.int(50, "EMA Slow Length", minval=1, group="Entry Settings")
+usePullbackDepth = input.bool(false, "Use Pullback Depth Filter", group="Entry Settings")
+pullbackBars = input.int(5, "Pullback Lookback Bars", minval=1, group="Entry Settings")
+pullbackATRmult = input.float(0.3, "Pullback ATR Multiplier", minval=0, group="Entry Settings")
+
+// Pivot Settings
+pivotLeft = input.int(3, "Pivot Left Bars", minval=1, group="Entry Settings")
+pivotRight = input.int(3, "Pivot Right Bars", minval=1, group="Entry Settings")
+retestBars = input.int(10, "Retest Lookback Bars", minval=1, group="Entry Settings")
+retestATRmult = input.float(0.25, "Retest ATR Multiplier", minval=0, group="Entry Settings")
+atrLen = input.int(14, "ATR Length", minval=1, group="Entry Settings")
+
+// Position sizing
+qtyContracts = input.int(1, "Contracts/Qty", minval=1, group="Entry Settings")
+
+// ============================================================================
+// 6) EXIT STYLE SELECTION
+// ============================================================================
+exitStyle = input.string("Ride (Trigger-based)", "Exit Style",
+                         options=["Ride (Trigger-based)", "Faster Protection", "ATR Stop + Signal Exit"],
+                         group="Exit Settings")
+
+// Stop settings
+stopType = input.string("ATR Stop", "Stop Type", options=["ATR Stop", "Structure Stop"], group="Exit Settings")
+stopATRmult = input.float(1.2, "Stop ATR Multiplier", minval=0.1, group="Exit Settings")
+
+// Take Profit settings
+useTakeProfit = input.bool(true, "Use Take Profit", group="Exit Settings")
+riskRewardTP = input.float(2.0, "Risk:Reward TP", minval=0.5, group="Exit Settings")
+usePartialTP = input.bool(true, "Use Partial TP", group="Exit Settings")
+partialTP_RR = input.float(1.0, "Partial TP R:R", minval=0.5, group="Exit Settings")
+partialQtyPct = input.float(50, "Partial Qty %", minval=1, maxval=99, group="Exit Settings")
+
+// Faster Protection settings
+moveToBreakeven = input.bool(true, "Move to Breakeven at +1R", group="Exit Settings")
+
+// ============================================================================
+// 7) VISUAL SETTINGS
+// ============================================================================
+showEMAs = input.bool(true, "Show EMAs", group="Visuals")
+showPivots = input.bool(true, "Show Pivot Levels", group="Visuals")
+showModeShading = input.bool(true, "Show Mode Background", group="Visuals")
+showTable = input.bool(true, "Show Info Table", group="Visuals")
+
+// ============================================================================
+// HELPER FUNCTIONS: ADX + Z-SCORE CALCULATION
+// ============================================================================
+
+// Function to calculate z-score of ADX for a given timeframe
+// Returns [zADX, zSlope, longBias, shortBias, rawADX]
+f_zADX(simple string tf, simple int adxLength, simple int zWindow) =>
+    // Calculate in native timeframe context to avoid normalization distortion
+    [plusDI, minusDI, adx] = request.security(syminfo.tickerid, tf, 
+         [ta.dmi(adxLength, adxLength)[0], ta.dmi(adxLength, adxLength)[1], ta.adx(adxLength)],
+         lookahead=barmerge.lookahead_off)
+    
+    // Direction bias
+    longBias = plusDI > minusDI
+    shortBias = minusDI > plusDI
+    
+    // Z-score calculation in native TF
+    mean = ta.sma(adx, zWindow)
+    stdev = ta.stdev(adx, zWindow)
+    stdev_clamped = math.max(stdev, 0.0001)  // Floor to avoid division by zero
+    zADX = (adx - mean) / stdev_clamped
+    zSlope = zADX - zADX[1]
+    
+    [zADX, zSlope, longBias, shortBias, adx]
+
+// Calculate for all timeframes
+[zADX_entry, zSlope_entry, longBias_entry, shortBias_entry, rawADX_entry] = 
+     f_zADX(tf_entry, adxLen, zWin_entry)
+
+[zADX_trigger, zSlope_trigger, longBias_trigger, shortBias_trigger, rawADX_trigger] = 
+     f_zADX(tf_trigger, adxLen, zWin_trigger)
+
+[zADX_regime, zSlope_regime, longBias_regime, shortBias_regime, rawADX_regime] = 
+     f_zADX(tf_regime, adxLen, zWin_regime)
+
+[zADX_backdrop, zSlope_backdrop, longBias_backdrop, shortBias_backdrop, rawADX_backdrop] = 
+     f_zADX(tf_backdrop, adxLen, zWin_backdrop)
+
+// ============================================================================
+// MODE STATE MACHINE
+// ============================================================================
+
+// TREND MODE CONDITIONS
+backdropTrendCapable = zADX_backdrop > zTrendCapable
+regimeActive = zADX_regime > zRegimeOn and zSlope_regime > 0
+
+// Trend Long Mode
+TrendLongMode = backdropTrendCapable and regimeActive and 
+                longBias_backdrop and longBias_regime
+
+// Trend Short Mode
+TrendShortMode = backdropTrendCapable and regimeActive and 
+                 shortBias_backdrop and shortBias_regime
+
+// MIXED MODE CONDITIONS (expansion burst)
+mixedModeBurst = zADX_trigger > 0.5 and zSlope_trigger > 0 and
+                 zADX_entry > 0.5 and zSlope_entry > 0
+
+MixedModeBurstLong = allowMixedMode and mixedModeBurst and 
+                     longBias_trigger and longBias_entry
+
+MixedModeBurstShort = allowMixedMode and mixedModeBurst and 
+                      shortBias_trigger and shortBias_entry
+
+// NO TRADE MODE (default)
+NoTradeMode = not TrendLongMode and not TrendShortMode and 
+              not (allowMixedMode and mixedModeBurst)
+
+// ============================================================================
+// TRADE PERMISSION LAYER
+// ============================================================================
+
+// Trigger turning on
+TriggerTurningOn = ta.crossover(zADX_trigger, 0) or 
+                   (zADX_trigger > zTriggerMin and zSlope_trigger > 0)
+
+// Entry gate
+EntryGateLong = longBias_entry and zSlope_entry > 0
+EntryGateShort = shortBias_entry and zSlope_entry > 0
+
+// Long Permission
+LongPermission = (TrendLongMode and TriggerTurningOn and EntryGateLong) or
+                 (MixedModeBurstLong and EntryGateLong)
+
+// Short Permission
+ShortPermission = (TrendShortMode and TriggerTurningOn and EntryGateShort) or
+                  (MixedModeBurstShort and EntryGateShort)
+
+// ============================================================================
+// ENTRY SIGNAL LOGIC
+// ============================================================================
+
+// EMAs (calculated on entry timeframe)
+emaFast = request.security(syminfo.tickerid, tf_entry, ta.ema(close, emaFastLen), 
+          lookahead=barmerge.lookahead_off)
+emaSlow = request.security(syminfo.tickerid, tf_entry, ta.ema(close, emaSlowLen), 
+          lookahead=barmerge.lookahead_off)
+
+// ATR for entry timeframe
+atrEntry = request.security(syminfo.tickerid, tf_entry, ta.atr(atrLen), 
+           lookahead=barmerge.lookahead_off)
+
+var float lastPivotHigh = na
+var float lastPivotLow = na
+var int barsSincePivotHighBreak = 999
+var int barsSincePivotLowBreak = 999
+
+// Update pivots (confirmed)
+pivotHighValue = ta.pivothigh(high, pivotLeft, pivotRight)
+pivotLowValue = ta.pivotlow(low, pivotLeft, pivotRight)
+
+if not na(pivotHighValue)
+    lastPivotHigh := pivotHighValue
+
+if not na(pivotLowValue)
+    lastPivotLow := pivotLowValue
+
+// Track bars since pivot break
+if not na(close) and not na(lastPivotHigh)
+    if ta.crossover(close, lastPivotHigh)
+        barsSincePivotHighBreak := 0
+    else if barsSincePivotHighBreak < 999
+        barsSincePivotHighBreak += 1
+
+if not na(close) and not na(lastPivotLow)
+    if ta.crossunder(close, lastPivotLow)
+        barsSincePivotLowBreak := 0
+    else if barsSincePivotLowBreak < 999
+        barsSincePivotLowBreak += 1
+
+// ENTRY STYLE 1: EMA Pullback / Reclaim
+emaLongTrend = emaFast > emaSlow
+emaShortTrend = emaFast < emaSlow
+
+emaReclaimLong = close > emaFast and close[1] <= emaFast[1]
+emaReclaimShort = close < emaFast and close[1] >= emaFast[1]
+
+pullbackDepthOK_Long = true
+pullbackDepthOK_Short = true
+
+if usePullbackDepth
+    lowestRecent = ta.lowest(low, pullbackBars)
+    highestRecent = ta.highest(high, pullbackBars)
+    pullbackDepthOK_Long := lowestRecent < emaFast - pullbackATRmult * atrEntry
+    pullbackDepthOK_Short := highestRecent > emaFast + pullbackATRmult * atrEntry
+
+entrySignalEMA_Long = LongPermission and emaLongTrend and emaReclaimLong and pullbackDepthOK_Long
+entrySignalEMA_Short = ShortPermission and emaShortTrend and emaReclaimShort and pullbackDepthOK_Short
+
+// ENTRY STYLE 2: Break + Retest (Pivot)
+retestLong = false
+retestShort = false
+
+if not na(lastPivotHigh) and barsSincePivotHighBreak <= retestBars
+    // Check for retest near the pivot high
+    retestLong := low <= lastPivotHigh + retestATRmult * atrEntry and 
+                  close > lastPivotHigh
+
+if not na(lastPivotLow) and barsSincePivotLowBreak <= retestBars
+    // Check for retest near the pivot low
+    retestShort := high >= lastPivotLow - retestATRmult * atrEntry and 
+                   close < lastPivotLow
+
+entrySignalPivot_Long = LongPermission and retestLong
+entrySignalPivot_Short = ShortPermission and retestShort
+
+// ENTRY STYLE 3: Simple Market (Permission Only)
+entrySignalSimple_Long = LongPermission and not LongPermission[1]
+entrySignalSimple_Short = ShortPermission and not ShortPermission[1]
+
+// Select entry signal based on style
+entrySignal_Long = entryStyle == "EMA Pullback / Reclaim" ? entrySignalEMA_Long :
+                   entryStyle == "Break + Retest (Pivot)" ? entrySignalPivot_Long :
+                   entrySignalSimple_Long
+
+entrySignal_Short = entryStyle == "EMA Pullback / Reclaim" ? entrySignalEMA_Short :
+                    entryStyle == "Break + Retest (Pivot)" ? entrySignalPivot_Short :
+                    entrySignalSimple_Short
+
+// ============================================================================
+// POSITION TRACKING
+// ============================================================================
+var float entryPrice = na
+var float stopLoss = na
+var float takeProfit = na
+var float partialTP = na
+var bool partialTaken = false
+
+// ============================================================================
+// ENTRY EXECUTION
+// ============================================================================
+if entrySignal_Long and strategy.position_size == 0
+    entryPrice := close
+    stopLoss := entryPrice - stopATRmult * atrEntry
+    riskAmount = entryPrice - stopLoss
+    takeProfit := entryPrice + riskRewardTP * riskAmount
+    partialTP := entryPrice + partialTP_RR * riskAmount
+    partialTaken := false
+    strategy.entry("Long", strategy.long, qty=qtyContracts)
+
+if entrySignal_Short and strategy.position_size == 0
+    entryPrice := close
+    stopLoss := entryPrice + stopATRmult * atrEntry
+    riskAmount = stopLoss - entryPrice
+    takeProfit := entryPrice - riskRewardTP * riskAmount
+    partialTP := entryPrice - partialTP_RR * riskAmount
+    partialTaken := false
+    strategy.entry("Short", strategy.short, qty=qtyContracts)
+
+// ============================================================================
+// EXIT LOGIC
+// ============================================================================
+
+// Track consecutive negative slope bars on trigger TF
+var int negSlopeBarsCount = 0
+if strategy.position_size != 0
+    if zSlope_trigger < 0
+        negSlopeBarsCount += 1
+    else
+        negSlopeBarsCount := 0
+
+// EXIT STYLE A: Ride (Trigger-based)
+exitSignalRide_Long = shortBias_trigger or 
+                      (negSlopeBarsCount >= slopeBarsExit) or
+                      (zADX_trigger < zExitWeak)
+
+exitSignalRide_Short = longBias_trigger or 
+                       (negSlopeBarsCount >= slopeBarsExit) or
+                       (zADX_trigger < zExitWeak)
+
+// EXIT STYLE B: Faster Protection
+exitSignalFast_Long = shortBias_entry or (negSlopeBarsCount >= 2)
+exitSignalFast_Short = longBias_entry or (negSlopeBarsCount >= 2)
+
+// EXIT STYLE C: ATR Stop + Signal Exit
+exitSignalATR_Long = zSlope_trigger < 0 and zADX_trigger < 0
+exitSignalATR_Short = zSlope_trigger < 0 and zADX_trigger < 0
+
+// Select exit signal based on style
+exitSignal_Long = exitStyle == "Ride (Trigger-based)" ? exitSignalRide_Long :
+                  exitStyle == "Faster Protection" ? exitSignalFast_Long :
+                  exitSignalATR_Long
+
+exitSignal_Short = exitStyle == "Ride (Trigger-based)" ? exitSignalRide_Short :
+                   exitStyle == "Faster Protection" ? exitSignalFast_Short :
+                   exitSignalATR_Short
+
+// Partial TP
+if usePartialTP and not partialTaken
+    if strategy.position_size > 0 and close >= partialTP
+        strategy.close("Long", qty_percent=partialQtyPct, comment="Partial TP")
+        partialTaken := true
+        // Move to breakeven if enabled
+        if moveToBreakeven
+            stopLoss := entryPrice
+    
+    if strategy.position_size < 0 and close <= partialTP
+        strategy.close("Short", qty_percent=partialQtyPct, comment="Partial TP")
+        partialTaken := true
+        // Move to breakeven if enabled
+        if moveToBreakeven
+            stopLoss := entryPrice
+
+// Full exits
+if strategy.position_size > 0
+    // Stop loss and take profit
+    if useTakeProfit
+        strategy.exit("Exit Long", "Long", stop=stopLoss, limit=takeProfit)
+    else
+        strategy.exit("Exit Long", "Long", stop=stopLoss)
+    
+    // Signal exit
+    if exitSignal_Long
+        strategy.close("Long", comment="Signal Exit")
+
+if strategy.position_size < 0
+    // Stop loss and take profit
+    if useTakeProfit
+        strategy.exit("Exit Short", "Short", stop=stopLoss, limit=takeProfit)
+    else
+        strategy.exit("Exit Short", "Short", stop=stopLoss)
+    
+    // Signal exit
+    if exitSignal_Short
+        strategy.close("Short", comment="Signal Exit")
+
+// Reset tracking when flat
+if strategy.position_size == 0
+    entryPrice := na
+    stopLoss := na
+    takeProfit := na
+    partialTP := na
+    partialTaken := false
+    negSlopeBarsCount := 0
+
+// ============================================================================
+// VISUALS - OVERLAYS
+// ============================================================================
+
+// Plot EMAs
+plot(showEMAs ? emaFast : na, "EMA Fast", color=color.blue, linewidth=2)
+plot(showEMAs ? emaSlow : na, "EMA Slow", color=color.orange, linewidth=2)
+
+// Plot pivot levels
+plot(showPivots and not na(lastPivotHigh) ? lastPivotHigh : na, 
+     "Pivot High", color=color.red, style=plot.style_linebr, linewidth=1)
+plot(showPivots and not na(lastPivotLow) ? lastPivotLow : na, 
+     "Pivot Low", color=color.green, style=plot.style_linebr, linewidth=1)
+
+// Background shading by mode
+bgcolor(showModeShading and TrendLongMode ? color.new(color.green, 92) : na, title="Trend Long Mode")
+bgcolor(showModeShading and TrendShortMode ? color.new(color.red, 92) : na, title="Trend Short Mode")
+bgcolor(showModeShading and (MixedModeBurstLong or MixedModeBurstShort) ? color.new(color.yellow, 95) : na, title="Mixed Mode")
+
+// Entry/Exit markers
+plotshape(entrySignal_Long, "Long Entry", shape.triangleup, location.belowbar, 
+          color=color.green, size=size.small)
+plotshape(entrySignal_Short, "Short Entry", shape.triangledown, location.abovebar, 
+          color=color.red, size=size.small)
+
+// ============================================================================
+// VISUALS - SEPARATE PANE (Z-SCORES)
+// ============================================================================
+
+// Plot z-scores in separate pane
+plot(zADX_entry, "Z-ADX Entry", color=color.blue, linewidth=1, display=display.pane)
+plot(zADX_trigger, "Z-ADX Trigger", color=color.orange, linewidth=2, display=display.pane)
+plot(zADX_regime, "Z-ADX Regime", color=color.purple, linewidth=2, display=display.pane)
+plot(zADX_backdrop, "Z-ADX Backdrop", color=color.red, linewidth=2, display=display.pane)
+
+// Reference lines
+hline(0.0, "Zero Line", color=color.gray, linestyle=hline.style_solid)
+hline(0.5, "+0.5", color=color.green, linestyle=hline.style_dashed)
+hline(1.0, "+1.0", color=color.green, linestyle=hline.style_dotted)
+hline(-0.5, "-0.5", color=color.red, linestyle=hline.style_dashed)
+
+// Z-Slope as histogram
+plot(zSlope_trigger * 10, "Z-Slope Trigger x10", color=color.new(color.gray, 50), 
+     style=plot.style_histogram, display=display.pane)
+
+// ============================================================================
+// VISUALS - INFO TABLE
+// ============================================================================
+
+if showTable
+    var table infoTable = table.new(position.top_right, 4, 7, 
+                                     bgcolor=color.new(color.black, 85), 
+                                     border_width=1, border_color=color.gray)
+    
+    // Headers
+    if barstate.isfirst
+        table.cell(infoTable, 0, 0, "Timeframe", text_color=color.white, bgcolor=color.new(color.gray, 50))
+        table.cell(infoTable, 1, 0, "Z-ADX", text_color=color.white, bgcolor=color.new(color.gray, 50))
+        table.cell(infoTable, 2, 0, "Z-Slope", text_color=color.white, bgcolor=color.new(color.gray, 50))
+        table.cell(infoTable, 3, 0, "Direction", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    
+    // Entry TF
+    table.cell(infoTable, 0, 1, tf_entry, text_color=color.white)
+    table.cell(infoTable, 1, 1, str.tostring(math.round(zADX_entry, 2)), 
+               text_color=zADX_entry > 0 ? color.green : color.red)
+    table.cell(infoTable, 2, 1, str.tostring(math.round(zSlope_entry, 3)), 
+               text_color=zSlope_entry > 0 ? color.green : color.red)
+    table.cell(infoTable, 3, 1, longBias_entry ? "Long" : "Short", 
+               text_color=longBias_entry ? color.green : color.red)
+    
+    // Trigger TF
+    table.cell(infoTable, 0, 2, tf_trigger, text_color=color.white)
+    table.cell(infoTable, 1, 2, str.tostring(math.round(zADX_trigger, 2)), 
+               text_color=zADX_trigger > 0 ? color.green : color.red)
+    table.cell(infoTable, 2, 2, str.tostring(math.round(zSlope_trigger, 3)), 
+               text_color=zSlope_trigger > 0 ? color.green : color.red)
+    table.cell(infoTable, 3, 2, longBias_trigger ? "Long" : "Short", 
+               text_color=longBias_trigger ? color.green : color.red)
+    
+    // Regime TF
+    table.cell(infoTable, 0, 3, tf_regime, text_color=color.white)
+    table.cell(infoTable, 1, 3, str.tostring(math.round(zADX_regime, 2)), 
+               text_color=zADX_regime > 0 ? color.green : color.red)
+    table.cell(infoTable, 2, 3, str.tostring(math.round(zSlope_regime, 3)), 
+               text_color=zSlope_regime > 0 ? color.green : color.red)
+    table.cell(infoTable, 3, 3, longBias_regime ? "Long" : "Short", 
+               text_color=longBias_regime ? color.green : color.red)
+    
+    // Backdrop TF
+    table.cell(infoTable, 0, 4, tf_backdrop, text_color=color.white)
+    table.cell(infoTable, 1, 4, str.tostring(math.round(zADX_backdrop, 2)), 
+               text_color=zADX_backdrop > 0 ? color.green : color.red)
+    table.cell(infoTable, 2, 4, str.tostring(math.round(zSlope_backdrop, 3)), 
+               text_color=zSlope_backdrop > 0 ? color.green : color.red)
+    table.cell(infoTable, 3, 4, longBias_backdrop ? "Long" : "Short", 
+               text_color=longBias_backdrop ? color.green : color.red)
+    
+    // Mode display
+    table.cell(infoTable, 0, 5, "Mode:", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    modeText = TrendLongMode ? "Trend Long" : 
+               TrendShortMode ? "Trend Short" : 
+               (MixedModeBurstLong or MixedModeBurstShort) ? "Mixed Burst" : 
+               "No Trade"
+    modeColor = TrendLongMode ? color.green : 
+                TrendShortMode ? color.red : 
+                (MixedModeBurstLong or MixedModeBurstShort) ? color.yellow : 
+                color.gray
+    table.cell(infoTable, 1, 5, modeText, text_color=modeColor)
+    table.cell(infoTable, 2, 5, "", bgcolor=color.new(color.black, 100))
+    table.cell(infoTable, 3, 5, "", bgcolor=color.new(color.black, 100))
+    
+    // Permissions
+    table.cell(infoTable, 0, 6, "Permission:", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    permText = LongPermission ? "Long OK" : ShortPermission ? "Short OK" : "None"
+    permColor = LongPermission ? color.green : ShortPermission ? color.red : color.gray
+    table.cell(infoTable, 1, 6, permText, text_color=permColor)
+    table.cell(infoTable, 2, 6, "", bgcolor=color.new(color.black, 100))
+    table.cell(infoTable, 3, 6, "", bgcolor=color.new(color.black, 100))
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(TrendLongMode and not TrendLongMode[1], "Trend Long Mode ON", "Trend Long Mode activated")
+alertcondition(not TrendLongMode and TrendLongMode[1], "Trend Long Mode OFF", "Trend Long Mode deactivated")
+alertcondition(TrendShortMode and not TrendShortMode[1], "Trend Short Mode ON", "Trend Short Mode activated")
+alertcondition(not TrendShortMode and TrendShortMode[1], "Trend Short Mode OFF", "Trend Short Mode deactivated")
+
+alertcondition(LongPermission and not LongPermission[1], "Long Permission", "Long permission activated")
+alertcondition(ShortPermission and not ShortPermission[1], "Short Permission", "Short permission activated")
+
+alertcondition(entrySignal_Long, "Long Entry", "Long entry signal triggered")
+alertcondition(entrySignal_Short, "Short Entry", "Short entry signal triggered")
+
+alertcondition(exitSignal_Long and strategy.position_size > 0, "Long Exit", "Long exit signal triggered")
+alertcondition(exitSignal_Short and strategy.position_size < 0, "Short Exit", "Short exit signal triggered")
