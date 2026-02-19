@@ -70,7 +70,8 @@ else if close <= current_renko_low - renko_box_size  // ✅ Proper operator
 
 1. **Initialization (First Bar)**:
    ```pinescript
-   if barstate.isfirst
+   // Only initialize if not already initialized (double-check with na())
+   if barstate.isfirst and na(current_renko_high)
        [h, l, b, lb] = renko_init()        // Function returns values
        current_renko_high := h              // Update global in global scope ✅
        current_renko_low := l               // Update global in global scope ✅
@@ -101,12 +102,20 @@ From the PineScript v6 documentation:
 
 > **Export Functions Restriction**: "Exported functions cannot use variables from the global scope if they are arrays, mutable variables (reassigned with :=), or variables of 'input' form."
 
-While this specifically mentions exported library functions, the same principle applies to regular functions - they should not modify mutable global variables. The proper pattern is:
+While this restriction is explicitly stated for exported library functions, it reflects a **best practice** that should be applied to all user-defined functions in PineScript v6. The proper pattern is:
 
 1. ✅ Functions can READ global variables
 2. ✅ Functions can return values
-3. ❌ Functions should NOT modify global variables with `:=`
+3. ❌ Functions should NOT modify global variables with `:=` (best practice)
 4. ✅ Global scope should handle all global variable updates
+
+**Why this matters**: Functions that modify global variables can lead to:
+- Unexpected behavior in local scopes
+- Difficulty tracking state changes
+- Issues with time series consistency
+- Code that is harder to maintain and debug
+
+By having functions return values and updating globals in the global scope, the code is clearer, more maintainable, and follows PineScript's execution model properly.
 
 ## Testing Notes
 

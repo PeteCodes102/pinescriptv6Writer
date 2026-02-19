@@ -56,7 +56,8 @@ draw_renko_brick(brick_top, brick_bottom, brick_bar, brick_color) =>
          )
         array.push(renko_boxes, brick)
         
-        // Keep only last 500 boxes to prevent memory issues
+        // Keep only last 500 boxes to prevent memory issues and maintain performance
+        // This limit ensures the chart remains responsive while showing sufficient history
         if array.size(renko_boxes) > 500
             old_box = array.shift(renko_boxes)
             box.delete(old_box)
@@ -102,8 +103,8 @@ update_renko() =>
 
 // --- MAIN EXECUTION ---
 
-// Initialize on first bar
-if barstate.isfirst
+// Initialize on first bar (only if not already initialized)
+if barstate.isfirst and na(current_renko_high)
     [h, l, b, lb] = renko_init()
     current_renko_high := h
     current_renko_low := l
