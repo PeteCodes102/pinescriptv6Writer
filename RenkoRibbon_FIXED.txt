@@ -1,0 +1,144 @@
+//@version=6
+// ============================================================================
+// RENKO RIBBON - Power Tool Snippet
+// ============================================================================
+// Description: Accurately paint traditional Renko bricks on the chart without
+//              repainting. Creates a true Renko ribbon visualization.
+// 
+// INTEGRATION:
+// 1. Copy this entire section into your indicator script (after //@version=6)
+// 2. The tool outputs visual boxes representing Renko bricks
+// 3. Use renko_is_bullish and renko_is_bearish in your strategy logic
+// 4. Access current_renko_high and current_renko_low for price levels
+// ============================================================================
+
+// --- INPUTS ---
+use_renko = input.bool(true, "Enable Renko Ribbon", group="Renko Ribbon")
+renko_box_size = input.float(10.0, "Brick Size", minval=0.01, tooltip="Size of each Renko brick in price units", group="Renko Ribbon")
+renko_bull_color = input.color(color.new(color.green, 70), "Bullish Brick Color", group="Renko Ribbon")
+renko_bear_color = input.color(color.new(color.red, 70), "Bearish Brick Color", group="Renko Ribbon")
+show_renko_ribbon = input.bool(true, "Show Renko Ribbon on Chart", tooltip="Display Renko bricks as boxes", group="Renko Ribbon")
+
+// --- STATE VARIABLES ---
+// Persistent variables to track Renko state
+var float current_renko_high = na
+var float current_renko_low = na
+var bool renko_is_bullish = na
+var array<box> renko_boxes = array.new<box>()
+var int last_brick_bar = na
+
+// --- HELPER FUNCTIONS ---
+
+// Initialize Renko state on first bar
+// Returns: [high, low, is_bullish, brick_bar]
+renko_init() =>
+    float init_high = close + renko_box_size
+    float init_low = close
+    bool init_bullish = true
+    int init_bar = bar_index
+    [init_high, init_low, init_bullish, init_bar]
+
+// Calculate how many bricks should form based on price movement
+calc_brick_count(price_move, brick_size) =>
+    math.floor(math.abs(price_move) / brick_size)
+
+// Draw a single Renko brick
+draw_renko_brick(brick_top, brick_bottom, brick_bar, brick_color) =>
+    if show_renko_ribbon and use_renko
+        brick = box.new(
+             left=brick_bar, 
+             top=brick_top, 
+             right=brick_bar + 1, 
+             bottom=brick_bottom,
+             bgcolor=brick_color,
+             border_color=brick_color,
+             border_width=1
+         )
+        array.push(renko_boxes, brick)
+        
+        // Keep only last 500 boxes to prevent memory issues and maintain performance
+        // This limit ensures the chart remains responsive while showing sufficient history
+        if array.size(renko_boxes) > 500
+            old_box = array.shift(renko_boxes)
+            box.delete(old_box)
+
+// Update Renko state based on current price
+// Returns: [new_high, new_low, new_bullish, new_brick_bar]
+update_renko() =>
+    float new_high = current_renko_high
+    float new_low = current_renko_low
+    bool new_bullish = renko_is_bullish
+    int new_brick_bar = last_brick_bar
+    
+    if use_renko
+        // Check for bullish bricks
+        if close >= current_renko_high + renko_box_size
+            bricks_to_add = calc_brick_count(close - current_renko_high, renko_box_size)
+            
+            for i = 0 to int(bricks_to_add) - 1
+                brick_bottom = current_renko_low + (i * renko_box_size)
+                brick_top = brick_bottom + renko_box_size
+                draw_renko_brick(brick_top, brick_bottom, bar_index, renko_bull_color)
+                new_low := brick_bottom
+                new_high := brick_top
+                new_brick_bar := bar_index
+            
+            new_bullish := true
+            
+        // Check for bearish bricks
+        else if close <= current_renko_low - renko_box_size
+            bricks_to_add = calc_brick_count(current_renko_low - close, renko_box_size)
+            
+            for i = 0 to int(bricks_to_add) - 1
+                brick_top = current_renko_high - (i * renko_box_size)
+                brick_bottom = brick_top - renko_box_size
+                draw_renko_brick(brick_top, brick_bottom, bar_index, renko_bear_color)
+                new_high := brick_top
+                new_low := brick_bottom
+                new_brick_bar := bar_index
+            
+            new_bullish := false
+    
+    [new_high, new_low, new_bullish, new_brick_bar]
+
+// --- MAIN EXECUTION ---
+
+// Initialize on first bar (only if not already initialized)
+if barstate.isfirst and na(current_renko_high)
+    [h, l, b, lb] = renko_init()
+    current_renko_high := h
+    current_renko_low := l
+    renko_is_bullish := b
+    last_brick_bar := lb
+
+// Update Renko on confirmed bars only (no repainting)
+if barstate.isconfirmed and use_renko
+    [new_h, new_l, new_b, new_lb] = update_renko()
+    current_renko_high := new_h
+    current_renko_low := new_l
+    renko_is_bullish := new_b
+    last_brick_bar := new_lb
+
+// --- OUTPUT VARIABLES ---
+// These can be used in your strategy conditions
+renko_direction = renko_is_bullish ? 1 : -1
+renko_brick_high = current_renko_high
+renko_brick_low = current_renko_low
+
+// --- USAGE EXAMPLE ---
+// if long_condition and renko_is_bullish
+//     strategy.entry("Long", strategy.long)
+//
+// if short_condition and not renko_is_bullish
+//     strategy.entry("Short", strategy.short)
+//
+// // Access current brick levels:
+// stop_loss = renko_is_bullish ? renko_brick_low : renko_brick_high
+
+// Optional: Plot brick levels for reference
+plot(use_renko ? current_renko_high : na, "Renko High", color=color.new(color.green, 50), linewidth=1, style=plot.style_stepline)
+plot(use_renko ? current_renko_low : na, "Renko Low", color=color.new(color.red, 50), linewidth=1, style=plot.style_stepline)
+
+// ============================================================================
+// END OF RENKO RIBBON
+// ============================================================================
